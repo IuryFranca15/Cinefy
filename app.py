@@ -31,6 +31,7 @@ from cinefy.database import (
 )
 from cinefy.helpers import changed_metadata_rows, passwords_match, safe_poster_url
 from cinefy.letterboxd import parse_letterboxd_uploads
+from cinefy.ui import aero_layout, brand_html, card_title, inject_theme, metric_card, orb, page_header, status_pill
 from cinefy.tmdb_client import (
     TMDBAbortError,
     find_and_enrich_movie,
@@ -58,106 +59,7 @@ st.set_page_config(
 )
 
 
-# ----------------------------- visual identity -----------------------------
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800;900&display=swap');
-    :root {
-      --aero-blue: #168fca;
-      --aero-deep: #0879ad;
-      --aero-cyan: #53d8e8;
-      --aero-green: #8adf9b;
-      --aero-ink: #17415d;
-      --glass: rgba(255,255,255,.72);
-    }
-    html, body, [class*="css"] { font-family: 'Nunito', sans-serif; }
-    .stApp {
-      background:
-        radial-gradient(ellipse at 12% 8%, rgba(255,255,255,.95) 0 3%, transparent 15%),
-        radial-gradient(ellipse at 86% 16%, rgba(255,255,255,.72) 0 4%, transparent 17%),
-        radial-gradient(ellipse at 68% 70%, rgba(94,224,229,.20), transparent 34%),
-        linear-gradient(145deg, #eafaff 0%, #c9f0fb 39%, #e7f8ed 100%);
-      color: var(--aero-ink);
-    }
-    [data-testid="stHeader"] { background: rgba(255,255,255,.2); }
-    [data-testid="stSidebar"] {
-      background: linear-gradient(180deg, rgba(255,255,255,.92), rgba(191,239,249,.88));
-      border-right: 1px solid rgba(255,255,255,.9);
-    }
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #24516c; }
-    h1, h2, h3 { color: #0c6596 !important; letter-spacing: -.035em; }
-    .hero {
-      position: relative; overflow: hidden; padding: 27px 30px 25px;
-      border-radius: 26px; margin: 3px 0 22px;
-      color: #fff; border: 1px solid rgba(255,255,255,.85);
-      background: linear-gradient(120deg, rgba(21,139,196,.97), rgba(67,204,219,.93) 58%, rgba(139,224,169,.94));
-      box-shadow: 0 12px 30px rgba(24,135,171,.18), inset 0 2px 0 rgba(255,255,255,.52);
-    }
-    .hero:after {
-      content: ' '; position:absolute; width:250px; height:250px; right:-42px; top:-130px;
-      border-radius:50%; background:rgba(255,255,255,.16); border:1px solid rgba(255,255,255,.2);
-      box-shadow:0 0 0 23px rgba(255,255,255,.06), 0 0 0 48px rgba(255,255,255,.04);
-    }
-    .hero h1 { color:#fff !important; font-size:2.55rem; margin:0; font-weight:900; }
-    .hero p { color:rgba(255,255,255,.94); font-size:1.03rem; margin:.35rem 0 0; }
-    .glass-card {
-      padding: 18px 20px; border-radius: 20px; margin-bottom: 12px;
-      background: linear-gradient(145deg, rgba(255,255,255,.88), rgba(255,255,255,.52));
-      border: 1px solid rgba(255,255,255,.95);
-      box-shadow: 0 8px 22px rgba(43,132,164,.09), inset 0 1px 0 rgba(255,255,255,.95);
-      backdrop-filter: blur(12px);
-    }
-    .metric-label { color:#41748b; font-size:.83rem; font-weight:800; text-transform:uppercase; letter-spacing:.06em; }
-    .metric-value { color:#087eae; font-size:1.9rem; font-weight:900; line-height:1.25; }
-    .metric-note { color:#5e8191; font-size:.84rem; }
-    .aero-pill { display:inline-block; border-radius:999px; padding:5px 11px; margin:3px 4px 3px 0;
-      color:#17617e; background:linear-gradient(180deg,#fff,#dff7fc); border:1px solid #b7e8f2;
-      box-shadow: inset 0 1px 1px #fff, 0 2px 5px rgba(37,142,170,.08); font-size:.78rem; font-weight:800; }
-    .callout {
-      padding:15px 17px; border-radius:17px; background:rgba(255,255,255,.65);
-      border:1px solid rgba(255,255,255,.95); box-shadow:inset 0 1px 0 white;
-    }
-    .muted { color:#5a7f91; }
-    div.stButton > button, div.stDownloadButton > button, a[kind="primary"] {
-      border-radius:13px; border:1px solid rgba(255,255,255,.9); color:#fff;
-      background:linear-gradient(180deg,#48c7e2,#168cc3); font-weight:800;
-      box-shadow:0 4px 10px rgba(14,126,173,.18), inset 0 1px 0 rgba(255,255,255,.45);
-    }
-    div.stButton > button:hover, div.stDownloadButton > button:hover {
-      color:#fff; border-color:#fff; background:linear-gradient(180deg,#5ed7e9,#087fb5);
-      transform:translateY(-1px);
-    }
-    [data-testid="stMetric"] { background:rgba(255,255,255,.68); border:1px solid white; padding:14px 16px; border-radius:18px; box-shadow:0 6px 18px rgba(35,130,160,.08); }
-    [data-testid="stDataFrame"] { border:1px solid rgba(255,255,255,.9); border-radius:14px; overflow:hidden; }
-    .stTextInput input, .stSelectbox div[data-baseweb="select"], .stMultiSelect div[data-baseweb="select"] {
-      border-radius:12px !important;
-    }
-    hr { border-color:rgba(71,170,195,.18); }
-    #MainMenu, footer { visibility:hidden; }
-    /* Refinamentos de legibilidade, responsividade e estados interativos */
-    .block-container { max-width: 1480px; padding-top: 1.6rem; padding-bottom: 3rem; }
-    [data-testid="stSidebar"] { min-width: 245px; }
-    [data-testid="stTabs"] button { font-weight: 800; }
-    div[data-testid="stExpander"] { border: 1px solid rgba(255,255,255,.9); border-radius: 16px; background: rgba(255,255,255,.48); }
-    div[data-testid="stAlert"] { border-radius: 14px; }
-    div[data-testid="stPlotlyChart"] { border: 1px solid rgba(255,255,255,.85); border-radius: 18px; padding: 8px; background: rgba(255,255,255,.36); }
-    .stDataFrame, .stDataEditor { background: rgba(255,255,255,.72); }
-    button[kind="primary"], button[kind="secondary"] { min-height: 2.65rem; transition: all .18s ease; }
-    a { color: #087eae; font-weight: 700; }
-    @media (max-width: 760px) {
-      .block-container { padding: 1rem .85rem 2rem; }
-      .hero { padding: 22px 19px; border-radius: 20px; }
-      .hero h1 { font-size: 1.75rem; line-height: 1.15; }
-      .hero p { font-size: .92rem; }
-      .glass-card { padding: 15px; border-radius: 16px; }
-      .metric-value { font-size: 1.55rem; }
-      [data-testid="stMetric"] { padding: 10px 12px; }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+inject_theme()
 
 
 # ------------------------------- app helpers -------------------------------
@@ -178,7 +80,7 @@ def require_app_password() -> bool:
         return True
     if st.session_state.get("cinefy_authenticated"):
         return True
-    st.markdown('<div class="hero"><h1>🔐 Cinefy</h1><p>Um espaço pessoal para sua música e seu cinema.</p></div>', unsafe_allow_html=True)
+    page_header("Cinefy", "Um espaço pessoal para sua música e seu cinema.", "lock")
     typed = st.text_input("Senha de acesso", type="password")
     if st.button("Entrar no Cinefy", width="stretch"):
         if passwords_match(typed, password):
@@ -252,21 +154,6 @@ def handle_spotify_callback() -> None:
     st.rerun()
 
 
-def page_header(title: str, subtitle: str, emoji: str = "✨") -> None:
-    st.markdown(
-        f'<div class="hero"><h1>{emoji} {html.escape(title)}</h1><p>{html.escape(subtitle)}</p></div>',
-        unsafe_allow_html=True,
-    )
-
-
-def metric_card(label: str, value: str, note: str = "") -> None:
-    st.markdown(
-        f'<div class="glass-card"><div class="metric-label">{html.escape(label)}</div>'
-        f'<div class="metric-value">{html.escape(value)}</div><div class="metric-note">{html.escape(note)}</div></div>',
-        unsafe_allow_html=True,
-    )
-
-
 def format_film_option(row: pd.Series) -> str:
     year = row.get("year")
     return f"{row.get('title', 'Filme')} ({int(year)})" if pd.notna(year) and str(year).strip() else str(row.get("title", "Filme"))
@@ -291,7 +178,7 @@ if not require_app_password():
 handle_spotify_callback()
 
 with st.sidebar:
-    st.markdown("<div style='font-size:2rem;font-weight:900;color:#087eae'>☁ Cinefy</div>", unsafe_allow_html=True)
+    st.markdown(brand_html(), unsafe_allow_html=True)
     st.caption("A trilha sonora da sua filmografia")
     page = st.radio(
         "Navegação",
@@ -301,10 +188,7 @@ with st.sidebar:
     )
     st.divider()
     token = current_token()
-    if token:
-        st.markdown("<span class='aero-pill'>● Spotify conectado</span>", unsafe_allow_html=True)
-    else:
-        st.markdown("<span class='aero-pill'>○ Spotify desconectado</span>", unsafe_allow_html=True)
+    st.markdown(status_pill("Spotify conectado" if token else "Spotify desconectado", bool(token)), unsafe_allow_html=True)
     st.caption("Cinefy v3 · Python + Streamlit")
 
 try:
@@ -320,29 +204,29 @@ if st.session_state.pop("_spotify_refresh_warning", False):
 
 # -------------------------------- dashboard ---------------------------------
 if page == "Visão geral":
-    page_header("Sua filmografia tem trilha sonora", "Cruze o que você ouve com o que você assiste — e descubra a estética que existe entre os dois.", "🌊")
+    page_header("Sua filmografia tem trilha sonora", "Cruze o que você ouve com o que você assiste — e descubra a estética que existe entre os dois.", "overview")
     c1, c2, c3 = st.columns(3)
     with c1:
-        metric_card("Filmes no Cinefy", str(len(films_df)), "Importados do seu Letterboxd")
+        metric_card("Filmes no Cinefy", str(len(films_df)), "Importados do seu Letterboxd", "film")
     with c2:
-        metric_card("Faixas no último sync", str(len(music_df)), "Seu Top Tracks do Spotify" if not music_df.empty else "Conecte o Spotify para começar")
+        metric_card("Faixas no último sync", str(len(music_df)), "Seu Top Tracks do Spotify" if not music_df.empty else "Conecte o Spotify para começar", "headphones")
     with c3:
         watched_count = int((~films_df.get("is_watchlist", pd.Series(dtype=bool)).fillna(False)).sum()) if not films_df.empty else 0
-        metric_card("Filmes assistidos", str(watched_count), "Registros do diário e avaliações")
+        metric_card("Filmes assistidos", str(watched_count), "Registros do diário e avaliações", "clapper")
 
     st.subheader("Seu painel estético")
     if music_df.empty and films_df.empty:
-        st.markdown("<div class='callout'>☀️ <b>Seu Cinefy está pronto para receber seus dados.</b><br><span class='muted'>Comece importando o arquivo ZIP/CSV exportado pelo Letterboxd (os CSVs individuais) e conectando sua conta Spotify.</span></div>", unsafe_allow_html=True)
+        st.markdown("<div class='callout'><b>Seu Cinefy está pronto para receber seus dados.</b><br><span class='muted'>Comece importando o arquivo ZIP/CSV exportado pelo Letterboxd (os CSVs individuais) e conectando sua conta Spotify.</span></div>", unsafe_allow_html=True)
         st.write("")
         a, b = st.columns(2)
         with a:
-            st.info("🎞️ **Primeiro:** vá até Letterboxd e importe `diary.csv`, `ratings.csv` e `watchlist.csv`.")
+            st.info("**Primeiro:** vá até Letterboxd e importe `diary.csv`, `ratings.csv` e `watchlist.csv`.")
         with b:
-            st.info("🎧 **Depois:** conecte seu Spotify na aba Spotify e sincronize suas músicas mais ouvidas.")
+            st.info("**Depois:** conecte seu Spotify na aba Spotify e sincronize suas músicas mais ouvidas.")
     else:
         a, b = st.columns(2)
-        with a:
-            st.markdown("<div class='glass-card'><b>🎧 Assinatura sonora</b>", unsafe_allow_html=True)
+        with a, st.container(border=True):
+            card_title("headphones", "Assinatura sonora")
             if not music_df.empty:
                 if music_df[["energy", "valence", "danceability"]].notna().sum().sum() > 0:
                     mood = describe_music_mood(music_df)
@@ -354,9 +238,8 @@ if page == "Visão geral":
                     st.caption("Faixas sincronizadas; o Spotify não disponibilizou as métricas de áudio nesta consulta.")
             else:
                 st.caption("Ainda não há dados musicais sincronizados.")
-            st.markdown("</div>", unsafe_allow_html=True)
-        with b:
-            st.markdown("<div class='glass-card'><b>🎬 Sua filmografia</b>", unsafe_allow_html=True)
+        with b, st.container(border=True):
+            card_title("clapper", "Sua filmografia")
             if not films_df.empty:
                 genre_counts: dict[str, int] = {}
                 for value in films_df.loc[~films_df["is_watchlist"].fillna(False), "genres"].fillna(""):
@@ -371,7 +254,6 @@ if page == "Visão geral":
                     st.caption("Adicione gêneros aos seus filmes na aba Letterboxd para descobrir sua estética cinematográfica.")
             else:
                 st.caption("Importe seu histórico do Letterboxd para começar.")
-            st.markdown("</div>", unsafe_allow_html=True)
 
     chart_columns = {"track_name", "energy", "valence", "danceability", "artist_names"}
     if not music_df.empty and chart_columns.issubset(music_df.columns) and music_df[["energy", "valence"]].notna().any().all():
@@ -380,7 +262,7 @@ if page == "Visão geral":
         fig = px.bar(chart_df, x="track_name", y="energy", color="valence", hover_data=["artist_names", "danceability"],
                      labels={"track_name": "Faixa", "energy": "Energia", "valence": "Valência", "artist_names": "Artista"},
                      color_continuous_scale="Tealgrn")
-        fig.update_layout(plot_bgcolor="rgba(255,255,255,.35)", paper_bgcolor="rgba(255,255,255,0)", font_color="#24516c", margin=dict(l=5,r=5,t=20,b=5))
+        aero_layout(fig)
         st.plotly_chart(fig, width="stretch")
 
     if latest_snapshot:
@@ -388,7 +270,7 @@ if page == "Visão geral":
 
 # -------------------------------- Letterboxd --------------------------------
 elif page == "Letterboxd":
-    page_header("Sua filmografia", "Importe seu histórico e enriqueça cada filme automaticamente com dados cinematográficos do TMDB.", "🎞️")
+    page_header("Sua filmografia", "Importe seu histórico e enriqueça cada filme automaticamente com dados cinematográficos do TMDB.", "film")
     st.markdown("<div class='callout'>No Letterboxd, use <b>Settings → Import & Export → Export Your Data</b>. Extraia o arquivo e selecione os CSVs abaixo. O Cinefy reconhece diário, avaliações e watchlist.</div>", unsafe_allow_html=True)
     uploads = st.file_uploader("Selecione os CSVs do Letterboxd", type=["csv"], accept_multiple_files=True, key="lb_uploads")
     if uploads and st.button("Importar histórico", type="primary"):
@@ -406,7 +288,7 @@ elif page == "Letterboxd":
     films_df = get_films()
     if not films_df.empty:
         st.divider()
-        st.subheader("🪄 Enriquecimento automático com TMDB")
+        st.subheader("Enriquecimento automático com TMDB")
         if not is_tmdb_configured():
             st.warning("Configure o token do TMDB em `.streamlit/secrets.toml` para buscar gêneros, diretores, sinopses e pôsteres automaticamente.")
             st.code('[tmdb]\nbearer_token = "SEU_API_READ_ACCESS_TOKEN"', language="toml")
@@ -616,7 +498,7 @@ elif page == "Letterboxd":
                     if poster_url:
                         st.image(poster_url, width="stretch")
                     else:
-                        st.markdown("<div class='glass-card' style='text-align:center;padding:48px 8px'>🎞️<br><span class='muted'>Pôster indisponível</span></div>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='glass-card' style='text-align:center;padding:40px 8px'>{orb('film', 'md')}<br><span class='muted'>Pôster indisponível</span></div>", unsafe_allow_html=True)
                     st.markdown(f"**{html.escape(str(film_row['title']))}**")
                     st.caption(f"{html.escape(str(film_row.get('year') or ''))} · {html.escape(str(film_row.get('director') or 'Direção não informada'))}")
                     st.caption(str(film_row.get("genres") or "Gêneros não informados"))
@@ -644,13 +526,13 @@ elif page == "Letterboxd":
 
 # ---------------------------------- Spotify ----------------------------------
 elif page == "Spotify":
-    page_header("Sua identidade sonora", "Conecte o Spotify, sincronize suas faixas e transforme seu gosto musical em dados exploráveis.", "🎧")
+    page_header("Sua identidade sonora", "Conecte o Spotify, sincronize suas faixas e transforme seu gosto musical em dados exploráveis.", "headphones")
     if not is_spotify_configured():
         st.warning("Falta configurar Spotify Client ID e Client Secret. Veja o arquivo README.md e o exemplo em .streamlit/secrets.toml.example.")
     else:
         token = current_token()
         if not token:
-            st.markdown("<div class='callout'>🔒 O Cinefy só acessa os dados depois da sua autorização. A conexão utiliza OAuth do Spotify.</div>", unsafe_allow_html=True)
+            st.markdown("<div class='callout'>O Cinefy só acessa os dados depois da sua autorização. A conexão utiliza OAuth do Spotify.</div>", unsafe_allow_html=True)
             auth_url = build_authorize_url(make_state())
             st.link_button("Conectar minha conta Spotify", auth_url, width="stretch")
             st.caption("Permissões solicitadas: ler Top Artists/Tracks e criar playlists privadas.")
@@ -683,7 +565,8 @@ elif page == "Spotify":
         latest_df = build_music_dataframe(latest_snapshot.get("tracks", []))
         if not latest_df.empty:
             show_cols = [c for c in ["track_name", "artist_names", "album_name", "energy", "valence", "danceability"] if c in latest_df.columns]
-            st.dataframe(latest_df[show_cols].rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "album_name":"Álbum", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade"}), width="stretch", hide_index=True)
+            st.dataframe(latest_df[show_cols].rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "album_name":"Álbum", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade"}), width="stretch", hide_index=True,
+                         column_config={name: st.column_config.NumberColumn(name, format="percent") for name in ("Energia", "Valência", "Dançabilidade")})
             if latest_df[["energy", "valence", "danceability"]].notna().sum().sum() > 0:
                 mood = describe_music_mood(latest_df)
                 st.markdown(f"<div class='glass-card'><b>{html.escape(mood['headline'])}</b><p class='muted'>{html.escape(mood['description'])}</p></div>", unsafe_allow_html=True)
@@ -692,7 +575,7 @@ elif page == "Spotify":
 
 # ------------------------------- Director's Cut ------------------------------
 elif page == "Director's Cut":
-    page_header("Director's Cut", "Uma trilha sonora alternativa feita com as músicas que já fazem parte da sua vida.", "🎬")
+    page_header("Director's Cut", "Uma trilha sonora alternativa feita com as músicas que já fazem parte da sua vida.", "clapper")
     if films_df.empty:
         st.info("Importe seu diário do Letterboxd primeiro.")
     elif music_df.empty:
@@ -722,7 +605,8 @@ elif page == "Director's Cut":
             st.warning("O Spotify não forneceu métricas de áudio para estas faixas. A lista mantém a ordem original e não inventa uma compatibilidade.")
         else:
             st.caption("A compatibilidade considera somente as métricas realmente disponíveis em cada faixa.")
-        st.dataframe(ranked[[c for c in ["track_name", "artist_names", "energy", "valence", "danceability", "match_score"] if c in ranked.columns]].head(15).rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade", "match_score":"Compatibilidade"}), width="stretch", hide_index=True)
+        st.dataframe(ranked[[c for c in ["track_name", "artist_names", "energy", "valence", "danceability", "match_score"] if c in ranked.columns]].head(15).rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade", "match_score":"Compatibilidade"}), width="stretch", hide_index=True,
+                     column_config={name: st.column_config.NumberColumn(name, format="percent") for name in ("Energia", "Valência", "Dançabilidade", "Compatibilidade")})
         playlist_name = f"Cinefy — {str(film['title'])[:70]}: Director's Cut"
         playlist_key = f"director_playlist_name_{selected_film_key}"  # um nome por filme, sem reaproveitar o do anterior
         st.text_input("Nome da playlist", value=playlist_name, key=playlist_key)
@@ -746,7 +630,7 @@ elif page == "Director's Cut":
 
 # -------------------------------- Mood Mirror --------------------------------
 elif page == "Mood Mirror":
-    page_header("Mood Mirror", "O espelho entre aquilo que você escuta e os mundos que escolhe assistir.", "🪞")
+    page_header("Mood Mirror", "O espelho entre aquilo que você escuta e os mundos que escolhe assistir.", "mirror")
     if music_df.empty:
         st.info("Sincronize seu Spotify para construir o Mood Mirror.")
     elif films_df.empty:
@@ -767,33 +651,30 @@ elif page == "Mood Mirror":
             st.warning(f"Métricas indisponíveis nesta sincronização: {missing_labels}. O Cinefy não substitui dados ausentes por valores neutros.")
         st.subheader("Duas linguagens, um mesmo repertório")
         left, right = st.columns(2)
-        with left:
-            st.markdown("<div class='glass-card'><h3>🎧 Som</h3>", unsafe_allow_html=True)
+        with left, st.container(border=True):
+            card_title("headphones", "Som")
             st.metric("Assinatura musical", mood["headline"])
             st.metric("Energia média", format_percent(mood.get("energy")))
             st.metric("Valência média", format_percent(mood.get("valence")))
             st.metric("Dançabilidade", format_percent(mood.get("danceability")))
-            st.markdown("</div>", unsafe_allow_html=True)
-        with right:
-            st.markdown("<div class='glass-card'><h3>🎞️ Cinema</h3>", unsafe_allow_html=True)
+        with right, st.container(border=True):
+            card_title("film", "Cinema")
             if genre_counts:
                 dominant = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-                for genre, count in dominant:
-                    st.markdown(f"<span class='aero-pill'>{html.escape(genre)} · {count}</span>", unsafe_allow_html=True)
+                st.markdown("".join(f"<span class='aero-pill'>{html.escape(genre)} · {count}</span>" for genre, count in dominant), unsafe_allow_html=True)
             else:
                 st.warning("Os gêneros dos seus filmes ainda não foram preenchidos. Edite-os na aba Letterboxd.")
-            st.markdown("</div>", unsafe_allow_html=True)
         if genre_counts:
             text = make_mood_mirror_text(mood, genre_counts)
-            st.markdown(f"<div class='callout'><h3>🫧 Leitura estética do período</h3><p>{html.escape(text)}</p><small class='muted'>É uma interpretação lúdica dos seus dados, não uma avaliação psicológica.</small></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='callout'><h3>Leitura estética do período</h3><p>{html.escape(text)}</p><small class='muted'>É uma interpretação lúdica dos seus dados, não uma avaliação psicológica.</small></div>", unsafe_allow_html=True)
             genre_df = pd.DataFrame([{"Gênero": k, "Filmes": v} for k, v in genre_counts.items()]).sort_values("Filmes", ascending=False)
             fig = px.pie(genre_df, names="Gênero", values="Filmes", hole=.48)
-            fig.update_layout(paper_bgcolor="rgba(255,255,255,0)", font_color="#24516c", legend_title_text="Gêneros")
+            aero_layout(fig, legend_title_text="Gêneros")
             st.plotly_chart(fig, width="stretch")
 
 # --------------------------- inverse recommendations ------------------------
 elif page == "Recomendação inversa":
-    page_header("Powered by Music", "Descubra o que assistir com base nos artistas e gêneros que dominam seus fones.", "🍿")
+    page_header("Powered by Music", "Descubra o que assistir com base nos artistas e gêneros que dominam seus fones.", "star")
     if music_df.empty:
         st.info("Sincronize seu Spotify primeiro.")
     elif films_df.empty:
