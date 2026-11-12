@@ -29,22 +29,25 @@ from cinefy.database import (
     update_film_metadata,
     update_tmdb_metadata,
 )
+from cinefy.helpers import changed_metadata_rows, passwords_match, safe_poster_url
 from cinefy.letterboxd import parse_letterboxd_uploads
 from cinefy.tmdb_client import (
+    TMDBAbortError,
     find_and_enrich_movie,
     get_movie_details,
     is_tmdb_configured,
     search_movies,
 )
 from cinefy.spotify_client import (
+    SpotifyTemporaryError,
     build_authorize_url,
     create_playlist,
     exchange_code,
-    get_spotify_config,
     is_spotify_configured,
+    make_state,
     refresh_access_token,
-    spotify_get,
     sync_top_music,
+    verify_state,
 )
 
 st.set_page_config(
@@ -177,8 +180,8 @@ def require_app_password() -> bool:
         return True
     st.markdown('<div class="hero"><h1>🔐 Cinefy</h1><p>Um espaço pessoal para sua música e seu cinema.</p></div>', unsafe_allow_html=True)
     typed = st.text_input("Senha de acesso", type="password")
-    if st.button("Entrar no Cinefy", use_container_width=True):
-        if secrets.compare_digest(typed, password):
+    if st.button("Entrar no Cinefy", width="stretch"):
+        if passwords_match(typed, password):
             st.session_state["cinefy_authenticated"] = True
             st.rerun()
         st.error("Senha incorreta.")
@@ -186,13 +189,31 @@ def require_app_password() -> bool:
     return False
 
 
+def flash(message: str, kind: str = "success") -> None:
+    """Guarda uma mensagem para ser exibida depois do próximo st.rerun()."""
+    st.session_state.setdefault("_flash", []).append((kind, message))
+
+
+def show_flash() -> None:
+    for kind, message in st.session_state.pop("_flash", []):
+        getattr(st, kind if kind in {"success", "info", "warning", "error"} else "info")(message)
+
+
 def current_token() -> dict[str, Any] | None:
     token = st.session_state.get("spotify_token")
     if not token:
         return None
-    expires_at = float(token.get("expires_at", 0))
+    try:
+        expires_at = float(token.get("expires_at", 0) or 0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
     if expires_at <= datetime.now(timezone.utc).timestamp() + 60:
-        refreshed = refresh_access_token(token)
+        try:
+            refreshed = refresh_access_token(token)
+        except SpotifyTemporaryError:
+            # Falha de rede: mantém a sessão; o token será renovado na próxima tentativa.
+            st.session_state["_spotify_refresh_warning"] = True
+            return token
         if refreshed:
             st.session_state["spotify_token"] = refreshed
             token = refreshed
@@ -205,24 +226,30 @@ def current_token() -> dict[str, Any] | None:
 def handle_spotify_callback() -> None:
     params = st.query_params
     code = params.get("code")
-    returned_state = params.get("state")
+    error = params.get("error")
+    if error and not code:
+        st.query_params.clear()
+        flash("A autorização do Spotify foi cancelada ou negada. Você pode tentar conectar novamente." if error == "access_denied"
+              else f"O Spotify devolveu um erro de autorização ({error}).", "warning")
+        return
     if not code:
         return
-    expected_state = st.session_state.get("spotify_oauth_state")
-    if not expected_state or returned_state != expected_state:
-        st.error("Não foi possível validar o retorno do Spotify. Tente conectar novamente.")
+    # O redirect do Spotify cria uma sessão nova; por isso o state é validado pela assinatura.
+    if not verify_state(str(params.get("state") or "")):
         st.query_params.clear()
+        flash("Não foi possível validar o retorno do Spotify (link expirado ou inválido). Tente conectar novamente.", "error")
         return
     try:
         token = exchange_code(str(code))
-        st.session_state["spotify_token"] = token
-        st.session_state.pop("spotify_oauth_state", None)
-        st.query_params.clear()
-        st.success("Spotify conectado!")
-        st.rerun()
     except Exception as exc:
-        st.error(f"Falha ao conectar ao Spotify: {exc}")
         st.query_params.clear()
+        flash(f"Falha ao conectar ao Spotify: {exc}", "error")
+        return
+    st.session_state["spotify_token"] = token
+    st.session_state["page"] = "Spotify"
+    st.query_params.clear()
+    flash("Spotify conectado!")
+    st.rerun()
 
 
 def page_header(title: str, subtitle: str, emoji: str = "✨") -> None:
@@ -240,13 +267,6 @@ def metric_card(label: str, value: str, note: str = "") -> None:
     )
 
 
-def get_music_dataframe() -> pd.DataFrame:
-    snapshot = get_latest_snapshot()
-    if not snapshot:
-        return pd.DataFrame()
-    return build_music_dataframe(snapshot.get("tracks", []))
-
-
 def format_film_option(row: pd.Series) -> str:
     year = row.get("year")
     return f"{row.get('title', 'Filme')} ({int(year)})" if pd.notna(year) and str(year).strip() else str(row.get("title", "Filme"))
@@ -261,7 +281,11 @@ def format_percent(value: Any) -> str:
 
 
 # ------------------------------- app startup -------------------------------
-init_db()
+try:
+    init_db()
+except Exception as exc:
+    st.error(f"Não consegui acessar o banco de dados. Confira a configuração em [database] ou apague a variável DATABASE_URL para usar o SQLite local. Detalhe: {exc}")
+    st.stop()
 if not require_app_password():
     st.stop()
 handle_spotify_callback()
@@ -273,6 +297,7 @@ with st.sidebar:
         "Navegação",
         ["Visão geral", "Letterboxd", "Spotify", "Director's Cut", "Mood Mirror", "Recomendação inversa"],
         label_visibility="collapsed",
+        key="page",
     )
     st.divider()
     token = current_token()
@@ -282,9 +307,16 @@ with st.sidebar:
         st.markdown("<span class='aero-pill'>○ Spotify desconectado</span>", unsafe_allow_html=True)
     st.caption("Cinefy v3 · Python + Streamlit")
 
-films_df = get_films()
-latest_snapshot = get_latest_snapshot()
+try:
+    films_df = get_films()
+    latest_snapshot = get_latest_snapshot()
+except Exception as exc:
+    st.error(f"Não consegui ler seus dados no banco. Detalhe: {exc}")
+    st.stop()
 music_df = build_music_dataframe(latest_snapshot.get("tracks", [])) if latest_snapshot else pd.DataFrame()
+show_flash()
+if st.session_state.pop("_spotify_refresh_warning", False):
+    st.warning("Não consegui renovar a sessão do Spotify agora (falha de rede). A conexão foi mantida; tente novamente em instantes.")
 
 # -------------------------------- dashboard ---------------------------------
 if page == "Visão geral":
@@ -341,14 +373,15 @@ if page == "Visão geral":
                 st.caption("Importe seu histórico do Letterboxd para começar.")
             st.markdown("</div>", unsafe_allow_html=True)
 
-    if not music_df.empty:
+    chart_columns = {"track_name", "energy", "valence", "danceability", "artist_names"}
+    if not music_df.empty and chart_columns.issubset(music_df.columns) and music_df[["energy", "valence"]].notna().any().all():
         st.subheader("O som que mais aparece no seu perfil")
         chart_df = music_df.head(12).copy()
         fig = px.bar(chart_df, x="track_name", y="energy", color="valence", hover_data=["artist_names", "danceability"],
                      labels={"track_name": "Faixa", "energy": "Energia", "valence": "Valência", "artist_names": "Artista"},
                      color_continuous_scale="Tealgrn")
         fig.update_layout(plot_bgcolor="rgba(255,255,255,.35)", paper_bgcolor="rgba(255,255,255,0)", font_color="#24516c", margin=dict(l=5,r=5,t=20,b=5))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     if latest_snapshot:
         st.caption(f"Última sincronização do Spotify: {latest_snapshot.get('created_at', 'data não informada')} · período: {latest_snapshot.get('time_range', 'médio prazo')}")
@@ -365,7 +398,7 @@ elif page == "Letterboxd":
                 st.warning("Não encontrei filmes reconhecíveis. Confira se selecionou os CSVs exportados pelo Letterboxd.")
             else:
                 save_films(imported.to_dict("records"))
-                st.success(f"{len(imported)} filmes processados e salvos no Cinefy.")
+                flash(f"{len(imported)} filmes processados e salvos no Cinefy.")
                 st.rerun()
         except Exception as exc:
             st.error(f"Não consegui ler os arquivos: {exc}")
@@ -400,6 +433,8 @@ elif page == "Letterboxd":
                     not_found_count_run = 0
                     errors: list[str] = []
                     review_candidates = st.session_state.get("tmdb_review_candidates", {})
+                    aborted = ""
+                    processed = 0
                     for index, (_, film_row) in enumerate(to_process.iterrows(), start=1):
                         try:
                             details, candidates = find_and_enrich_movie(str(film_row["title"]), int(film_row["year"]) if pd.notna(film_row.get("year")) else None)
@@ -413,13 +448,20 @@ elif page == "Letterboxd":
                             else:
                                 update_tmdb_metadata(str(film_row["film_key"]), {"metadata_status": "not_found", "metadata_source": "TMDB"})
                                 not_found_count_run += 1
+                        except TMDBAbortError as exc:
+                            # Credencial recusada ou limite de uso: continuar só repetiria o erro.
+                            aborted = str(exc)
+                            break
                         except Exception as exc:
                             errors.append(f"{film_row['title']}: {exc}")
+                        processed = index
                         progress.progress(index / len(to_process))
                     st.session_state["tmdb_review_candidates"] = review_candidates
-                    st.success(f"Concluído: {success_count} identificado(s), {review_count} para revisão e {not_found_count_run} sem resultado.")
+                    flash(f"Concluído: {success_count} identificado(s), {review_count} para revisão e {not_found_count_run} sem resultado.")
+                    if aborted:
+                        flash(f"Processamento interrompido após {processed} filme(s): {aborted}", "error")
                     if errors:
-                        st.warning("Algumas consultas falharam: " + " · ".join(errors[:5]))
+                        flash("Algumas consultas falharam: " + " · ".join(errors[:5]), "warning")
                     st.rerun()
 
             # Manual resolution for ambiguous titles and films not found automatically.
@@ -428,11 +470,25 @@ elif page == "Letterboxd":
             if not unmatched.empty:
                 st.markdown("#### Conferir correspondências")
                 st.caption("O Cinefy evita escolher automaticamente quando títulos, remakes ou anos deixam a correspondência incerta. Selecione a versão correta abaixo.")
-                film_labels = {format_film_option(row): str(row["film_key"]) for _, row in unmatched.iterrows()}
-                selected_label = st.selectbox("Filme do Letterboxd", list(film_labels.keys()), key="tmdb_film_to_review")
-                selected_key = film_labels[selected_label]
+                # Opções por film_key: dois filmes com o mesmo título/ano não podem se sobrepor.
+                base_labels = {str(row["film_key"]): format_film_option(row) for _, row in unmatched.iterrows()}
+                label_counts: dict[str, int] = {}
+                for text in base_labels.values():
+                    label_counts[text] = label_counts.get(text, 0) + 1
+                film_labels = {key: (f"{text} · {key.rstrip('/').rsplit('/', 1)[-1][-12:]}" if label_counts[text] > 1 else text)
+                               for key, text in base_labels.items()}
+                selected_key = st.selectbox("Filme do Letterboxd", list(film_labels.keys()), format_func=lambda key: film_labels.get(key, key), key="tmdb_film_to_review")
                 selected_film = unmatched[unmatched["film_key"].astype(str) == selected_key].iloc[0]
                 default_year = int(selected_film["year"]) if pd.notna(selected_film.get("year")) else None
+                review_store: dict[str, list[dict[str, Any]]] = st.session_state.setdefault("tmdb_review_candidates", {})
+                # Os candidatos vivem só na sessão; ao reabrir um filme em revisão, a busca é refeita.
+                tried: set[str] = st.session_state.setdefault("tmdb_auto_tried", set())
+                if not review_store.get(selected_key) and selected_key not in tried and str(selected_film.get("metadata_status") or "") == "needs_review":
+                    tried.add(selected_key)
+                    try:
+                        review_store[selected_key] = search_movies(str(selected_film["title"]), default_year)[:8]
+                    except Exception as exc:
+                        st.warning(f"Não consegui recuperar as sugestões do TMDB: {exc}")
                 search_col, year_col = st.columns([3, 1])
                 with search_col:
                     manual_query = st.text_input("Título para pesquisar no TMDB", value=str(selected_film["title"]), key=f"tmdb_query_{selected_key}")
@@ -441,13 +497,12 @@ elif page == "Letterboxd":
                 if st.button("Pesquisar título no TMDB", key=f"tmdb_search_{selected_key}"):
                     try:
                         results = search_movies(manual_query, int(manual_year) if manual_year else None)
-                        st.session_state["tmdb_manual_candidates"] = results[:10]
-                        st.session_state["tmdb_manual_film_key"] = selected_key
+                        review_store[selected_key] = results[:10]
                         if not results:
                             st.info("Nenhum resultado encontrado. Tente o título original ou pesquise sem o ano.")
                     except Exception as exc:
                         st.error(f"Falha na pesquisa: {exc}")
-                candidates = st.session_state.get("tmdb_manual_candidates", []) if st.session_state.get("tmdb_manual_film_key") == selected_key else st.session_state.get("tmdb_review_candidates", {}).get(selected_key, [])
+                candidates = review_store.get(selected_key, [])
                 if candidates:
                     def candidate_label(item: dict[str, Any]) -> str:
                         release = str(item.get("release_date") or "")[:4] or "ano desconhecido"
@@ -455,19 +510,18 @@ elif page == "Letterboxd":
                         score = item.get("_cinefy_score")
                         score_text = f" · compatibilidade {score:.0%}" if isinstance(score, (int, float)) else ""
                         return f"{item.get('title') or original} ({release}) · original: {original} · TMDB #{item.get('id')}{score_text}"
-                    candidate_map = {candidate_label(item): item for item in candidates}
-                    chosen_label = st.selectbox("Escolha a correspondência correta", list(candidate_map.keys()), key=f"tmdb_candidate_{selected_key}")
-                    chosen = candidate_map[chosen_label]
+                    candidate_map = {str(item.get("id")): item for item in candidates}
+                    chosen_id = st.selectbox("Escolha a correspondência correta", list(candidate_map.keys()),
+                                             format_func=lambda cid: candidate_label(candidate_map[cid]), key=f"tmdb_candidate_{selected_key}")
+                    chosen = candidate_map[chosen_id]
                     overview_preview = str(chosen.get("overview") or "Sinopse indisponível na pesquisa.")
                     st.caption(overview_preview[:500] + ("…" if len(overview_preview) > 500 else ""))
                     if st.button("Confirmar filme e importar metadados", type="primary", key=f"tmdb_apply_{selected_key}"):
                         try:
                             details = get_movie_details(int(chosen["id"]))
                             update_tmdb_metadata(selected_key, details)
-                            st.session_state.get("tmdb_review_candidates", {}).pop(selected_key, None)
-                            st.session_state.pop("tmdb_manual_candidates", None)
-                            st.session_state.pop("tmdb_manual_film_key", None)
-                            st.success("Dados cinematográficos importados do TMDB.")
+                            review_store.pop(selected_key, None)
+                            flash("Dados cinematográficos importados do TMDB.")
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Não consegui importar os detalhes: {exc}")
@@ -519,9 +573,12 @@ elif page == "Letterboxd":
             "film_key": "Chave", "title": "Filme", "year": "Ano", "watched_date": "Data assistido",
             "rating": "Nota", "is_watchlist": "Na watchlist", "director": "Diretor", "genres": "Gêneros", "tags": "Tags"
         })
+        # A chave inclui os filtros: o st.data_editor guarda as edições por posição da linha,
+        # e trocar o filtro sem trocar a chave aplicaria as edições na linha errada.
+        editor_key = "film_editor_" + str(abs(hash((library_search.strip(), status_filter, decade_filter, genre_filter))))
         edited = st.data_editor(
             editable,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             disabled=["Chave", "Filme", "Ano", "Data assistido", "Nota", "Na watchlist", "Tags"],
             column_config={
@@ -530,13 +587,20 @@ elif page == "Letterboxd":
                 "Diretor": st.column_config.TextColumn("Diretor"),
                 "Gêneros": st.column_config.TextColumn("Gêneros", help="Separe por vírgula"),
             },
-            key="film_editor",
+            key=editor_key,
         )
         if st.button("Salvar gêneros e diretores", type="primary"):
-            updates = edited.rename(columns={"Chave": "film_key", "Diretor": "director", "Gêneros": "genres"})[["film_key", "director", "genres"]].to_dict("records")
-            update_film_metadata(updates)
-            st.success("Metadados atualizados manualmente.")
-            st.rerun()
+            columns = {"Chave": "film_key", "Diretor": "director", "Gêneros": "genres"}
+            updates = changed_metadata_rows(
+                editable.rename(columns=columns)[["film_key", "director", "genres"]],
+                edited.rename(columns=columns)[["film_key", "director", "genres"]],
+            )
+            if not updates:
+                st.info("Nenhuma alteração para salvar.")
+            else:
+                update_film_metadata(updates)
+                flash(f"Metadados de {len(updates)} filme(s) atualizados manualmente.")
+                st.rerun()
 
         st.subheader("Pôsteres e sinopses")
         enriched_all = library_view[library_view.get("tmdb_id", pd.Series(index=library_view.index, dtype="float64")).notna()]
@@ -548,9 +612,9 @@ elif page == "Letterboxd":
             poster_cols = st.columns(4)
             for index, (_, film_row) in enumerate(enriched.iterrows()):
                 with poster_cols[index % 4]:
-                    poster_url = str(film_row.get("poster_url") or "")
-                    if poster_url.startswith("https://"):
-                        st.image(poster_url, use_column_width=True)
+                    poster_url = safe_poster_url(film_row.get("poster_url"))
+                    if poster_url:
+                        st.image(poster_url, width="stretch")
                     else:
                         st.markdown("<div class='glass-card' style='text-align:center;padding:48px 8px'>🎞️<br><span class='muted'>Pôster indisponível</span></div>", unsafe_allow_html=True)
                     st.markdown(f"**{html.escape(str(film_row['title']))}**")
@@ -587,10 +651,8 @@ elif page == "Spotify":
         token = current_token()
         if not token:
             st.markdown("<div class='callout'>🔒 O Cinefy só acessa os dados depois da sua autorização. A conexão utiliza OAuth do Spotify.</div>", unsafe_allow_html=True)
-            if "spotify_oauth_state" not in st.session_state:
-                st.session_state["spotify_oauth_state"] = secrets.token_urlsafe(24)
-            auth_url = build_authorize_url(st.session_state["spotify_oauth_state"])
-            st.link_button("Conectar minha conta Spotify", auth_url, use_container_width=True)
+            auth_url = build_authorize_url(make_state())
+            st.link_button("Conectar minha conta Spotify", auth_url, width="stretch")
             st.caption("Permissões solicitadas: ler Top Artists/Tracks e criar playlists privadas.")
         else:
             st.success("Conexão Spotify autorizada nesta sessão.")
@@ -598,16 +660,18 @@ elif page == "Spotify":
             with col1:
                 time_range = st.selectbox("Janela de análise", ["short_term", "medium_term", "long_term"], index=1,
                                           format_func=lambda x: {"short_term": "Últimas 4 semanas", "medium_term": "Últimos 6 meses", "long_term": "Último ano"}[x])
-                if st.button("Sincronizar meu perfil musical", type="primary", use_container_width=True):
+                if st.button("Sincronizar meu perfil musical", type="primary", width="stretch"):
                     with st.spinner("Buscando suas músicas e calculando a assinatura sonora..."):
                         try:
                             payload = sync_top_music(time_range)
                             save_music_snapshot(payload)
-                            st.success(f"Sincronização concluída: {len(payload.get('tracks', []))} faixas e {len(payload.get('artists', []))} artistas.")
+                            flash(f"Sincronização concluída: {len(payload.get('tracks', []))} faixas e {len(payload.get('artists', []))} artistas.")
+                            if payload.get("tracks") and not any(t.get("energy") is not None for t in payload["tracks"]):
+                                flash("O Spotify não liberou as métricas de áudio (energia, valência, dançabilidade) para este aplicativo. Apps criados depois de 27/11/2024 não têm acesso a esse recurso; o Cinefy não inventa valores no lugar.", "warning")
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Não foi possível sincronizar: {exc}")
-                if st.button("Desconectar Spotify", use_container_width=True):
+                if st.button("Desconectar Spotify", width="stretch"):
                     st.session_state.pop("spotify_token", None)
                     st.rerun()
             with col2:
@@ -619,7 +683,7 @@ elif page == "Spotify":
         latest_df = build_music_dataframe(latest_snapshot.get("tracks", []))
         if not latest_df.empty:
             show_cols = [c for c in ["track_name", "artist_names", "album_name", "energy", "valence", "danceability"] if c in latest_df.columns]
-            st.dataframe(latest_df[show_cols].rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "album_name":"Álbum", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade"}), use_container_width=True, hide_index=True)
+            st.dataframe(latest_df[show_cols].rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "album_name":"Álbum", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade"}), width="stretch", hide_index=True)
             if latest_df[["energy", "valence", "danceability"]].notna().sum().sum() > 0:
                 mood = describe_music_mood(latest_df)
                 st.markdown(f"<div class='glass-card'><b>{html.escape(mood['headline'])}</b><p class='muted'>{html.escape(mood['description'])}</p></div>", unsafe_allow_html=True)
@@ -637,14 +701,17 @@ elif page == "Director's Cut":
         candidates = films_df[~films_df["is_watchlist"].fillna(False)].copy()
         if candidates.empty:
             candidates = films_df.copy()
-        selected_label = st.selectbox("Escolha um filme", candidates.apply(format_film_option, axis=1).tolist())
-        film = candidates.iloc[candidates.apply(format_film_option, axis=1).tolist().index(selected_label)]
+        candidates = candidates.reset_index(drop=True)
+        film_labels_dc = {str(row["film_key"]): format_film_option(row) for _, row in candidates.iterrows()}
+        selected_film_key = st.selectbox("Escolha um filme", list(film_labels_dc.keys()), format_func=lambda key: film_labels_dc.get(key, key), key="director_film_key")
+        film = candidates[candidates["film_key"].astype(str) == selected_film_key].iloc[0]
         genres = str(film.get("genres") or "").strip()
         director = str(film.get("director") or "").strip()
         film_poster_col, film_info_col = st.columns([1, 3])
         with film_poster_col:
-            if film.get("poster_url"):
-                st.image(str(film["poster_url"]), use_column_width=True)
+            director_poster = safe_poster_url(film.get("poster_url"))
+            if director_poster:
+                st.image(director_poster, width="stretch")
         with film_info_col:
             st.markdown(f"<div class='glass-card'><h3 style='margin-top:0'>{html.escape(str(film['title']))}</h3><span class='aero-pill'>{html.escape(str(int(film['year'])) if pd.notna(film.get('year')) else 'Ano não informado')}</span><span class='aero-pill'>{html.escape(genres or 'Gêneros não preenchidos')}</span><p class='muted'>Direção: {html.escape(director or 'não informada')}</p><p>{html.escape(str(film.get('overview') or 'Sinopse ainda não disponível.'))}</p></div>", unsafe_allow_html=True)
         target = get_film_mood_target(genres)
@@ -655,20 +722,25 @@ elif page == "Director's Cut":
             st.warning("O Spotify não forneceu métricas de áudio para estas faixas. A lista mantém a ordem original e não inventa uma compatibilidade.")
         else:
             st.caption("A compatibilidade considera somente as métricas realmente disponíveis em cada faixa.")
-        st.dataframe(ranked[[c for c in ["track_name", "artist_names", "energy", "valence", "danceability", "match_score"] if c in ranked.columns]].head(15).rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade", "match_score":"Compatibilidade"}), use_container_width=True, hide_index=True)
+        st.dataframe(ranked[[c for c in ["track_name", "artist_names", "energy", "valence", "danceability", "match_score"] if c in ranked.columns]].head(15).rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade", "match_score":"Compatibilidade"}), width="stretch", hide_index=True)
         playlist_name = f"Cinefy — {str(film['title'])[:70]}: Director's Cut"
-        st.text_input("Nome da playlist", value=playlist_name, key="director_playlist_name")
+        playlist_key = f"director_playlist_name_{selected_film_key}"  # um nome por filme, sem reaproveitar o do anterior
+        st.text_input("Nome da playlist", value=playlist_name, key=playlist_key)
         if st.button("Criar playlist no meu Spotify", type="primary"):
             token = current_token()
+            track_uris = ranked.head(30)["uri"].dropna().astype(str).tolist() if "uri" in ranked.columns else []
             if not token:
                 st.error("Conecte o Spotify na aba Spotify.")
+            elif not track_uris:
+                st.warning("Estas faixas não têm o identificador (URI) do Spotify. Sincronize o Spotify novamente para gerar a playlist.")
             else:
-                track_uris = ranked.head(30)["uri"].dropna().astype(str).tolist()
                 try:
-                    playlist = create_playlist(st.session_state["director_playlist_name"],
+                    playlist = create_playlist(st.session_state[playlist_key],
                                                f"Trilha alternativa gerada pelo Cinefy para {film['title']}. Seleção baseada na atmosfera do filme e no seu perfil musical.", track_uris)
                     st.success("Playlist criada no Spotify!")
-                    st.link_button("Abrir playlist", playlist["external_urls"]["spotify"])
+                    playlist_url = (playlist.get("external_urls") or {}).get("spotify")
+                    if playlist_url:
+                        st.link_button("Abrir playlist", playlist_url)
                 except Exception as exc:
                     st.error(f"Não consegui criar a playlist. Confira as permissões da conexão Spotify. Detalhe: {exc}")
 
@@ -717,7 +789,7 @@ elif page == "Mood Mirror":
             genre_df = pd.DataFrame([{"Gênero": k, "Filmes": v} for k, v in genre_counts.items()]).sort_values("Filmes", ascending=False)
             fig = px.pie(genre_df, names="Gênero", values="Filmes", hole=.48)
             fig.update_layout(paper_bgcolor="rgba(255,255,255,0)", font_color="#24516c", legend_title_text="Gêneros")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 # --------------------------- inverse recommendations ------------------------
 elif page == "Recomendação inversa":

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import os
+import secrets as _secrets
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -13,6 +16,47 @@ API_BASE = "https://api.spotify.com/v1"
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 SCOPES = ["user-top-read", "playlist-modify-private"]
+# O Spotify não aceita mais "localhost"; em HTTP só endereços de loopback (IP literal).
+DEFAULT_REDIRECT_URI = "http://127.0.0.1:8501"
+STATE_MAX_AGE_SECONDS = 10 * 60
+
+
+class SpotifyTemporaryError(RuntimeError):
+    """Falha transitória (rede, timeout, 5xx): a sessão não deve ser descartada."""
+
+
+def _state_key() -> bytes:
+    config = get_spotify_config()
+    key = f"cinefy-oauth-state:{config['client_secret']}"
+    return key.encode("utf-8")
+
+
+def make_state(now: float | None = None) -> str:
+    """Gera um `state` OAuth assinado (HMAC), que não depende de st.session_state.
+
+    O redirect do Spotify abre uma sessão Streamlit nova, então o estado não pode
+    ficar guardado na sessão: ele precisa ser verificável apenas pela assinatura.
+    """
+    issued = int(now if now is not None else time.time())
+    payload = f"{issued}.{_secrets.token_urlsafe(12)}"
+    signature = hmac.new(_state_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}.{signature}"
+
+
+def verify_state(state: str | None, now: float | None = None) -> bool:
+    if not state or not isinstance(state, str):
+        return False
+    parts = state.split(".")
+    if len(parts) != 3:
+        return False
+    issued_text, nonce, signature = parts
+    if not issued_text.isdigit() or not nonce:
+        return False
+    expected = hmac.new(_state_key(), f"{issued_text}.{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(signature.encode("utf-8"), expected.encode("utf-8")):
+        return False
+    age = (now if now is not None else time.time()) - int(issued_text)
+    return -30 <= age <= STATE_MAX_AGE_SECONDS
 
 
 def get_spotify_config() -> dict[str, str]:
@@ -23,7 +67,7 @@ def get_spotify_config() -> dict[str, str]:
     return {
         "client_id": str(section.get("client_id", "") or os.getenv("SPOTIFY_CLIENT_ID", "")).strip(),
         "client_secret": str(section.get("client_secret", "") or os.getenv("SPOTIFY_CLIENT_SECRET", "")).strip(),
-        "redirect_uri": str(section.get("redirect_uri", "") or os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8501")).strip(),
+        "redirect_uri": str(section.get("redirect_uri", "") or os.getenv("SPOTIFY_REDIRECT_URI", DEFAULT_REDIRECT_URI)).strip(),
     }
 
 
@@ -52,15 +96,36 @@ def _basic_auth_header() -> str:
 
 
 def _token_request(data: dict[str, str]) -> dict[str, Any]:
-    response = requests.post(
-        TOKEN_URL,
-        data=data,
-        headers={"Authorization": _basic_auth_header(), "Content-Type": "application/x-www-form-urlencoded"},
-        timeout=25,
-    )
-    response.raise_for_status()
-    result = response.json()
-    result["expires_at"] = time.time() + int(result.get("expires_in", 3600))
+    try:
+        response = requests.post(
+            TOKEN_URL,
+            data=data,
+            headers={"Authorization": _basic_auth_header(), "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=25,
+        )
+    except requests.Timeout as exc:
+        raise SpotifyTemporaryError("O Spotify demorou demais para responder. Tente novamente.") from exc
+    except requests.RequestException as exc:
+        raise SpotifyTemporaryError("Não foi possível falar com o Spotify. Verifique sua conexão.") from exc
+    if response.status_code >= 500 or response.status_code == 429:
+        raise SpotifyTemporaryError(f"O Spotify está indisponível no momento (HTTP {response.status_code}).")
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("error_description") or response.json().get("error") or ""
+        except ValueError:
+            detail = ""
+        raise RuntimeError(f"O Spotify recusou a autorização (HTTP {response.status_code}). {detail}".strip())
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise SpotifyTemporaryError("Resposta inválida do Spotify ao autenticar.") from exc
+    if not isinstance(result, dict) or not result.get("access_token"):
+        raise SpotifyTemporaryError("O Spotify não devolveu um token de acesso.")
+    try:
+        expires_in = int(result.get("expires_in", 3600))
+    except (TypeError, ValueError):
+        expires_in = 3600
+    result["expires_at"] = time.time() + expires_in
     return result
 
 
@@ -75,61 +140,97 @@ def exchange_code(code: str) -> dict[str, Any]:
 
 
 def refresh_access_token(token: dict[str, Any]) -> dict[str, Any] | None:
+    """Renova o token.
+
+    Devolve None quando a sessão não pode mais ser renovada (refresh token ausente
+    ou recusado). Falhas transitórias levantam `SpotifyTemporaryError`, para que o
+    chamador mantenha o token atual em vez de desconectar o usuário.
+    """
     refresh = token.get("refresh_token")
     if not refresh:
         return None
     try:
         refreshed = _token_request({"grant_type": "refresh_token", "refresh_token": str(refresh), "client_id": get_spotify_config()["client_id"]})
-        if "refresh_token" not in refreshed:
-            refreshed["refresh_token"] = refresh
-        return refreshed
-    except requests.RequestException:
+    except SpotifyTemporaryError:
+        raise
+    except RuntimeError:
         return None
+    if "refresh_token" not in refreshed:
+        refreshed["refresh_token"] = refresh
+    return refreshed
+
+
+class SpotifyHTTPError(RuntimeError):
+    """Erro HTTP da API do Spotify, já com mensagem em português."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _http_error_message(status: int) -> str:
+    if status in (403, 404):
+        return f"Spotify respondeu HTTP {status}. Verifique as permissões e as regras atuais do modo de desenvolvimento do Spotify (usuário autorizado no painel, escopos e recursos descontinuados)."
+    if status == 401:
+        return "Spotify respondeu HTTP 401. Sua sessão expirou; conecte novamente."
+    if status == 429:
+        return "Limite de requisições do Spotify atingido."
+    if status >= 500:
+        return f"O Spotify está instável no momento (HTTP {status}). Tente novamente em instantes."
+    return f"Spotify respondeu HTTP {status}."
+
+
+def _send(method: str, url: str, access_token: str, params: dict[str, Any] | None, json: dict[str, Any] | None) -> requests.Response:
+    try:
+        return requests.request(
+            method,
+            url,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            params=params,
+            json=json,
+            timeout=35,
+        )
+    except requests.Timeout as exc:
+        raise SpotifyTemporaryError("O Spotify demorou demais para responder. Tente novamente.") from exc
+    except requests.RequestException as exc:
+        raise SpotifyTemporaryError("Não foi possível falar com o Spotify. Verifique sua conexão.") from exc
 
 
 def spotify_request(method: str, endpoint: str, *, params: dict[str, Any] | None = None, json: dict[str, Any] | None = None) -> dict[str, Any]:
     token = st.session_state.get("spotify_token")
     if not token:
         raise RuntimeError("Conecte o Spotify primeiro.")
-    if float(token.get("expires_at", 0)) <= time.time() + 45:
-        token = refresh_access_token(token)
-        if not token:
+    if float(token.get("expires_at", 0) or 0) <= time.time() + 45:
+        renewed = refresh_access_token(token)  # SpotifyTemporaryError sobe sem apagar o token
+        if not renewed:
             st.session_state.pop("spotify_token", None)
             raise RuntimeError("Sua sessão Spotify expirou. Conecte novamente.")
+        token = renewed
         st.session_state["spotify_token"] = token
 
     url = endpoint if endpoint.startswith("http") else f"{API_BASE}{endpoint}"
-    response = requests.request(
-        method,
-        url,
-        headers={"Authorization": f"Bearer {token['access_token']}", "Content-Type": "application/json"},
-        params=params,
-        json=json,
-        timeout=35,
-    )
+    response = _send(method, url, token["access_token"], params, json)
     if response.status_code == 401:
         refreshed = refresh_access_token(token)
         if refreshed:
             st.session_state["spotify_token"] = refreshed
-            response = requests.request(
-                method, url,
-                headers={"Authorization": f"Bearer {refreshed['access_token']}", "Content-Type": "application/json"},
-                params=params, json=json, timeout=35,
-            )
+            response = _send(method, url, refreshed["access_token"], params, json)
     if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After", "alguns segundos")
-        raise RuntimeError(f"Limite de requisições do Spotify atingido. Tente novamente em {retry_after} segundos.")
-    response.raise_for_status()
-    return response.json() if response.content else {}
+        retry_after = response.headers.get("Retry-After", "alguns")
+        raise SpotifyHTTPError(429, f"Limite de requisições do Spotify atingido. Tente novamente em {retry_after} segundos.")
+    if response.status_code >= 400:
+        raise SpotifyHTTPError(response.status_code, _http_error_message(response.status_code))
+    if not response.content:
+        return {}
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise SpotifyTemporaryError("Resposta inválida do Spotify.") from exc
+    return payload if isinstance(payload, dict) else {}
 
 
 def spotify_get(endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    try:
-        return spotify_request("GET", endpoint, params=params)
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "desconhecido"
-        detail = "Verifique as permissões e as regras atuais do modo de desenvolvimento do Spotify." if status in (403, 404) else str(exc)
-        raise RuntimeError(f"Spotify respondeu HTTP {status}. {detail}") from exc
+    return spotify_request("GET", endpoint, params=params)
 
 
 def _audio_features(track_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -146,8 +247,8 @@ def _audio_features(track_ids: list[str]) -> dict[str, dict[str, Any]]:
 def sync_top_music(time_range: str = "medium_term") -> dict[str, Any]:
     if time_range not in {"short_term", "medium_term", "long_term"}:
         raise ValueError("Período inválido.")
-    top_tracks = spotify_get("/me/top/tracks", {"limit": 50, "time_range": time_range}).get("items", [])
-    top_artists = spotify_get("/me/top/artists", {"limit": 50, "time_range": time_range}).get("items", [])
+    top_tracks = [t for t in (spotify_get("/me/top/tracks", {"limit": 50, "time_range": time_range}).get("items") or []) if isinstance(t, dict)]
+    top_artists = [a for a in (spotify_get("/me/top/artists", {"limit": 50, "time_range": time_range}).get("items") or []) if isinstance(a, dict)]
 
     artist_genres: dict[str, list[str]] = {}
     for artist in top_artists:

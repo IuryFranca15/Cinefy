@@ -224,23 +224,43 @@ def get_films() -> pd.DataFrame:
         frame = pd.read_sql(select(films).order_by(films.c.title), connection)
     if frame.empty:
         return pd.DataFrame(columns=[column.name for column in films.columns] + ["is_watchlist_bool"])
-    frame["is_watchlist"] = frame["is_watchlist"].fillna(0).astype(bool)
-    frame["is_rewatch"] = frame["is_rewatch"].fillna(0).astype(bool)
+    for flag in ("is_watchlist", "is_rewatch"):
+        frame[flag] = pd.to_numeric(frame[flag], errors="coerce").fillna(0).astype(bool)
     return frame
 
 
-def update_film_metadata(records: list[dict[str, Any]]) -> None:
+def _text_or_empty(value: Any) -> str:
+    """Converte NaN/None em texto vazio, evitando gravar 'nan' ou NaN no banco."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def update_film_metadata(records: list[dict[str, Any]]) -> int:
+    """Atualiza diretor e gêneros editados manualmente. Retorna quantas linhas foram gravadas."""
+    written = 0
     if not records:
-        return
+        return written
     with get_engine().begin() as connection:
         for record in records:
-            connection.execute(
+            key = record.get("film_key")
+            if not key:
+                continue
+            result = connection.execute(
                 update(films)
-                .where(films.c.film_key == record["film_key"])
-                .values(director=record.get("director", ""), genres=record.get("genres", ""),
+                .where(films.c.film_key == str(key))
+                .values(director=_text_or_empty(record.get("director")),
+                        genres=_text_or_empty(record.get("genres")),
                         metadata_source="manual",
                         updated_at=datetime.now(timezone.utc).isoformat())
             )
+            written += result.rowcount or 0
+    return written
 
 
 def update_tmdb_metadata(film_key: str, details: dict[str, Any]) -> None:

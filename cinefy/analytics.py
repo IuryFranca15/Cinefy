@@ -253,12 +253,13 @@ def inverse_recommendations(music: pd.DataFrame, watchlist: pd.DataFrame) -> pd.
         return pd.DataFrame()
 
     records: list[dict[str, Any]] = []
-    denominator = len(preferred_film_genres)
     for _, film in watchlist.iterrows():
         genres = set(_split_genres(film.get("genres")))
         matches = sorted(genres.intersection(preferred_film_genres))
-        score = len(matches) / denominator if denominator else 0.0
         if genres and matches:
+            # Filmes com correspondência ficam sempre acima dos sem correspondência
+            # (0,15) e dos sem gênero (0,05); três gêneros em comum já dão 100%.
+            score = 0.30 + 0.70 * min(1.0, len(matches) / 3)
             reason = f"Combina com suas referências musicais: {', '.join(matches[:3])}."
         elif genres:
             reason = "Uma escolha fora do eixo dominante do seu som — boa para variar a sessão."

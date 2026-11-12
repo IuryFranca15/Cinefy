@@ -39,3 +39,19 @@ def test_save_films_uses_batch_upsert_and_preserves_existing_metadata(monkeypatc
     assert rows[0]["is_watchlist"] == 1
     assert rows[1]["title"] == "Filme B"
     engine.dispose()
+
+
+def test_update_film_metadata_never_writes_nan(monkeypatch, tmp_path):
+    import streamlit as st
+
+    from cinefy import database
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'meta.db'}")
+    st.cache_resource.clear()
+    database.init_db()
+    database.save_films([{"film_key": "k1", "title": "Filme", "year": 2000, "director": "Antigo", "genres": "Drama"}])
+    written = database.update_film_metadata([{"film_key": "k1", "director": float("nan"), "genres": "Terror"}, {"film_key": "", "director": "x"}])
+    assert written == 1
+    row = database.get_films().iloc[0]
+    assert row["director"] == "" and row["genres"] == "Terror" and row["metadata_source"] == "manual"
+    st.cache_resource.clear()
