@@ -46,3 +46,18 @@ def test_detects_unquoted_dotenv_secret(tmp_path: Path):
     (tmp_path / ".env").write_text("TMDB_BEARER_TOKEN=unquoted-secret-token-value\n", encoding="utf-8")
     issues = CinefyInspector(tmp_path).scan_codebase()
     assert any(issue.code == "POSSIBLE_CREDENTIAL" and issue.path == ".env" for issue in issues)
+
+
+def test_scans_example_templates_for_real_looking_credentials(tmp_path: Path):
+    secrets_dir = tmp_path / ".streamlit"
+    secrets_dir.mkdir()
+    fake_value = "abc12345" * 4  # montado em tempo de execução para não parecer credencial no código-fonte
+    (secrets_dir / "secrets.toml.example").write_text("[tmdb]\nbearer_token = " + '"' + fake_value + '"' + "\n", encoding="utf-8")
+    issues = CinefyInspector(tmp_path).scan_codebase()
+    assert any(issue.code == "POSSIBLE_CREDENTIAL" and issue.path.endswith("secrets.toml.example") for issue in issues)
+    assert not any(fake_value in str(issue) for issue in issues)
+
+
+def test_placeholder_values_in_example_templates_are_not_flagged(tmp_path: Path):
+    (tmp_path / "secrets.toml.example").write_text("[tmdb]\nbearer_token = " + '"COLOQUE_SEU_API_READ_ACCESS_TOKEN"' + "\n", encoding="utf-8")
+    assert not any(issue.code == "POSSIBLE_CREDENTIAL" for issue in CinefyInspector(tmp_path).scan_codebase())
