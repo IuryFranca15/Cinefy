@@ -1,0 +1,749 @@
+from __future__ import annotations
+
+import html
+import json
+import os
+import secrets
+from datetime import datetime, timezone
+from typing import Any
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+from cinefy.analytics import (
+    build_music_dataframe,
+    describe_music_mood,
+    get_film_mood_target,
+    inverse_recommendations,
+    make_mood_mirror_text,
+    rank_tracks_for_film,
+)
+from cinefy.database import (
+    get_films,
+    get_latest_snapshot,
+    get_snapshots,
+    init_db,
+    save_films,
+    save_music_snapshot,
+    update_film_metadata,
+    update_tmdb_metadata,
+)
+from cinefy.letterboxd import parse_letterboxd_uploads
+from cinefy.tmdb_client import (
+    find_and_enrich_movie,
+    get_movie_details,
+    is_tmdb_configured,
+    search_movies,
+)
+from cinefy.spotify_client import (
+    build_authorize_url,
+    create_playlist,
+    exchange_code,
+    get_spotify_config,
+    is_spotify_configured,
+    refresh_access_token,
+    spotify_get,
+    sync_top_music,
+)
+
+st.set_page_config(
+    page_title="Cinefy — sua filmografia tem trilha sonora",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ----------------------------- visual identity -----------------------------
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800;900&display=swap');
+    :root {
+      --aero-blue: #168fca;
+      --aero-deep: #0879ad;
+      --aero-cyan: #53d8e8;
+      --aero-green: #8adf9b;
+      --aero-ink: #17415d;
+      --glass: rgba(255,255,255,.72);
+    }
+    html, body, [class*="css"] { font-family: 'Nunito', sans-serif; }
+    .stApp {
+      background:
+        radial-gradient(ellipse at 12% 8%, rgba(255,255,255,.95) 0 3%, transparent 15%),
+        radial-gradient(ellipse at 86% 16%, rgba(255,255,255,.72) 0 4%, transparent 17%),
+        radial-gradient(ellipse at 68% 70%, rgba(94,224,229,.20), transparent 34%),
+        linear-gradient(145deg, #eafaff 0%, #c9f0fb 39%, #e7f8ed 100%);
+      color: var(--aero-ink);
+    }
+    [data-testid="stHeader"] { background: rgba(255,255,255,.2); }
+    [data-testid="stSidebar"] {
+      background: linear-gradient(180deg, rgba(255,255,255,.92), rgba(191,239,249,.88));
+      border-right: 1px solid rgba(255,255,255,.9);
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #24516c; }
+    h1, h2, h3 { color: #0c6596 !important; letter-spacing: -.035em; }
+    .hero {
+      position: relative; overflow: hidden; padding: 27px 30px 25px;
+      border-radius: 26px; margin: 3px 0 22px;
+      color: #fff; border: 1px solid rgba(255,255,255,.85);
+      background: linear-gradient(120deg, rgba(21,139,196,.97), rgba(67,204,219,.93) 58%, rgba(139,224,169,.94));
+      box-shadow: 0 12px 30px rgba(24,135,171,.18), inset 0 2px 0 rgba(255,255,255,.52);
+    }
+    .hero:after {
+      content: ' '; position:absolute; width:250px; height:250px; right:-42px; top:-130px;
+      border-radius:50%; background:rgba(255,255,255,.16); border:1px solid rgba(255,255,255,.2);
+      box-shadow:0 0 0 23px rgba(255,255,255,.06), 0 0 0 48px rgba(255,255,255,.04);
+    }
+    .hero h1 { color:#fff !important; font-size:2.55rem; margin:0; font-weight:900; }
+    .hero p { color:rgba(255,255,255,.94); font-size:1.03rem; margin:.35rem 0 0; }
+    .glass-card {
+      padding: 18px 20px; border-radius: 20px; margin-bottom: 12px;
+      background: linear-gradient(145deg, rgba(255,255,255,.88), rgba(255,255,255,.52));
+      border: 1px solid rgba(255,255,255,.95);
+      box-shadow: 0 8px 22px rgba(43,132,164,.09), inset 0 1px 0 rgba(255,255,255,.95);
+      backdrop-filter: blur(12px);
+    }
+    .metric-label { color:#41748b; font-size:.83rem; font-weight:800; text-transform:uppercase; letter-spacing:.06em; }
+    .metric-value { color:#087eae; font-size:1.9rem; font-weight:900; line-height:1.25; }
+    .metric-note { color:#5e8191; font-size:.84rem; }
+    .aero-pill { display:inline-block; border-radius:999px; padding:5px 11px; margin:3px 4px 3px 0;
+      color:#17617e; background:linear-gradient(180deg,#fff,#dff7fc); border:1px solid #b7e8f2;
+      box-shadow: inset 0 1px 1px #fff, 0 2px 5px rgba(37,142,170,.08); font-size:.78rem; font-weight:800; }
+    .callout {
+      padding:15px 17px; border-radius:17px; background:rgba(255,255,255,.65);
+      border:1px solid rgba(255,255,255,.95); box-shadow:inset 0 1px 0 white;
+    }
+    .muted { color:#5a7f91; }
+    div.stButton > button, div.stDownloadButton > button, a[kind="primary"] {
+      border-radius:13px; border:1px solid rgba(255,255,255,.9); color:#fff;
+      background:linear-gradient(180deg,#48c7e2,#168cc3); font-weight:800;
+      box-shadow:0 4px 10px rgba(14,126,173,.18), inset 0 1px 0 rgba(255,255,255,.45);
+    }
+    div.stButton > button:hover, div.stDownloadButton > button:hover {
+      color:#fff; border-color:#fff; background:linear-gradient(180deg,#5ed7e9,#087fb5);
+      transform:translateY(-1px);
+    }
+    [data-testid="stMetric"] { background:rgba(255,255,255,.68); border:1px solid white; padding:14px 16px; border-radius:18px; box-shadow:0 6px 18px rgba(35,130,160,.08); }
+    [data-testid="stDataFrame"] { border:1px solid rgba(255,255,255,.9); border-radius:14px; overflow:hidden; }
+    .stTextInput input, .stSelectbox div[data-baseweb="select"], .stMultiSelect div[data-baseweb="select"] {
+      border-radius:12px !important;
+    }
+    hr { border-color:rgba(71,170,195,.18); }
+    #MainMenu, footer { visibility:hidden; }
+    /* Refinamentos de legibilidade, responsividade e estados interativos */
+    .block-container { max-width: 1480px; padding-top: 1.6rem; padding-bottom: 3rem; }
+    [data-testid="stSidebar"] { min-width: 245px; }
+    [data-testid="stTabs"] button { font-weight: 800; }
+    div[data-testid="stExpander"] { border: 1px solid rgba(255,255,255,.9); border-radius: 16px; background: rgba(255,255,255,.48); }
+    div[data-testid="stAlert"] { border-radius: 14px; }
+    div[data-testid="stPlotlyChart"] { border: 1px solid rgba(255,255,255,.85); border-radius: 18px; padding: 8px; background: rgba(255,255,255,.36); }
+    .stDataFrame, .stDataEditor { background: rgba(255,255,255,.72); }
+    button[kind="primary"], button[kind="secondary"] { min-height: 2.65rem; transition: all .18s ease; }
+    a { color: #087eae; font-weight: 700; }
+    @media (max-width: 760px) {
+      .block-container { padding: 1rem .85rem 2rem; }
+      .hero { padding: 22px 19px; border-radius: 20px; }
+      .hero h1 { font-size: 1.75rem; line-height: 1.15; }
+      .hero p { font-size: .92rem; }
+      .glass-card { padding: 15px; border-radius: 16px; }
+      .metric-value { font-size: 1.55rem; }
+      [data-testid="stMetric"] { padding: 10px 12px; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ------------------------------- app helpers -------------------------------
+def secret_value(section: str, key: str, env_name: str = "") -> str:
+    value = ""
+    try:
+        value = st.secrets.get(section, {}).get(key, "")
+    except Exception:
+        pass
+    if not value and env_name:
+        value = os.getenv(env_name, "")
+    return str(value or "").strip()
+
+
+def require_app_password() -> bool:
+    password = secret_value("app", "password", "CINEFY_APP_PASSWORD")
+    if not password:
+        return True
+    if st.session_state.get("cinefy_authenticated"):
+        return True
+    st.markdown('<div class="hero"><h1>🔐 Cinefy</h1><p>Um espaço pessoal para sua música e seu cinema.</p></div>', unsafe_allow_html=True)
+    typed = st.text_input("Senha de acesso", type="password")
+    if st.button("Entrar no Cinefy", use_container_width=True):
+        if secrets.compare_digest(typed, password):
+            st.session_state["cinefy_authenticated"] = True
+            st.rerun()
+        st.error("Senha incorreta.")
+    st.caption("Configure app.password nos Secrets antes de publicar o aplicativo.")
+    return False
+
+
+def current_token() -> dict[str, Any] | None:
+    token = st.session_state.get("spotify_token")
+    if not token:
+        return None
+    expires_at = float(token.get("expires_at", 0))
+    if expires_at <= datetime.now(timezone.utc).timestamp() + 60:
+        refreshed = refresh_access_token(token)
+        if refreshed:
+            st.session_state["spotify_token"] = refreshed
+            token = refreshed
+        else:
+            st.session_state.pop("spotify_token", None)
+            return None
+    return token
+
+
+def handle_spotify_callback() -> None:
+    params = st.query_params
+    code = params.get("code")
+    returned_state = params.get("state")
+    if not code:
+        return
+    expected_state = st.session_state.get("spotify_oauth_state")
+    if not expected_state or returned_state != expected_state:
+        st.error("Não foi possível validar o retorno do Spotify. Tente conectar novamente.")
+        st.query_params.clear()
+        return
+    try:
+        token = exchange_code(str(code))
+        st.session_state["spotify_token"] = token
+        st.session_state.pop("spotify_oauth_state", None)
+        st.query_params.clear()
+        st.success("Spotify conectado!")
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Falha ao conectar ao Spotify: {exc}")
+        st.query_params.clear()
+
+
+def page_header(title: str, subtitle: str, emoji: str = "✨") -> None:
+    st.markdown(
+        f'<div class="hero"><h1>{emoji} {html.escape(title)}</h1><p>{html.escape(subtitle)}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def metric_card(label: str, value: str, note: str = "") -> None:
+    st.markdown(
+        f'<div class="glass-card"><div class="metric-label">{html.escape(label)}</div>'
+        f'<div class="metric-value">{html.escape(value)}</div><div class="metric-note">{html.escape(note)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def get_music_dataframe() -> pd.DataFrame:
+    snapshot = get_latest_snapshot()
+    if not snapshot:
+        return pd.DataFrame()
+    return build_music_dataframe(snapshot.get("tracks", []))
+
+
+def format_film_option(row: pd.Series) -> str:
+    year = row.get("year")
+    return f"{row.get('title', 'Filme')} ({int(year)})" if pd.notna(year) and str(year).strip() else str(row.get("title", "Filme"))
+
+
+def format_percent(value: Any) -> str:
+    """Show a dash for unavailable metrics instead of formatting them as zero."""
+    try:
+        return f"{float(value):.0%}" if value is not None and pd.notna(value) else "—"
+    except (TypeError, ValueError):
+        return "—"
+
+
+# ------------------------------- app startup -------------------------------
+init_db()
+if not require_app_password():
+    st.stop()
+handle_spotify_callback()
+
+with st.sidebar:
+    st.markdown("<div style='font-size:2rem;font-weight:900;color:#087eae'>☁ Cinefy</div>", unsafe_allow_html=True)
+    st.caption("A trilha sonora da sua filmografia")
+    page = st.radio(
+        "Navegação",
+        ["Visão geral", "Letterboxd", "Spotify", "Director's Cut", "Mood Mirror", "Recomendação inversa"],
+        label_visibility="collapsed",
+    )
+    st.divider()
+    token = current_token()
+    if token:
+        st.markdown("<span class='aero-pill'>● Spotify conectado</span>", unsafe_allow_html=True)
+    else:
+        st.markdown("<span class='aero-pill'>○ Spotify desconectado</span>", unsafe_allow_html=True)
+    st.caption("Cinefy v3 · Python + Streamlit")
+
+films_df = get_films()
+latest_snapshot = get_latest_snapshot()
+music_df = build_music_dataframe(latest_snapshot.get("tracks", [])) if latest_snapshot else pd.DataFrame()
+
+# -------------------------------- dashboard ---------------------------------
+if page == "Visão geral":
+    page_header("Sua filmografia tem trilha sonora", "Cruze o que você ouve com o que você assiste — e descubra a estética que existe entre os dois.", "🌊")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        metric_card("Filmes no Cinefy", str(len(films_df)), "Importados do seu Letterboxd")
+    with c2:
+        metric_card("Faixas no último sync", str(len(music_df)), "Seu Top Tracks do Spotify" if not music_df.empty else "Conecte o Spotify para começar")
+    with c3:
+        watched_count = int((~films_df.get("is_watchlist", pd.Series(dtype=bool)).fillna(False)).sum()) if not films_df.empty else 0
+        metric_card("Filmes assistidos", str(watched_count), "Registros do diário e avaliações")
+
+    st.subheader("Seu painel estético")
+    if music_df.empty and films_df.empty:
+        st.markdown("<div class='callout'>☀️ <b>Seu Cinefy está pronto para receber seus dados.</b><br><span class='muted'>Comece importando o arquivo ZIP/CSV exportado pelo Letterboxd (os CSVs individuais) e conectando sua conta Spotify.</span></div>", unsafe_allow_html=True)
+        st.write("")
+        a, b = st.columns(2)
+        with a:
+            st.info("🎞️ **Primeiro:** vá até Letterboxd e importe `diary.csv`, `ratings.csv` e `watchlist.csv`.")
+        with b:
+            st.info("🎧 **Depois:** conecte seu Spotify na aba Spotify e sincronize suas músicas mais ouvidas.")
+    else:
+        a, b = st.columns(2)
+        with a:
+            st.markdown("<div class='glass-card'><b>🎧 Assinatura sonora</b>", unsafe_allow_html=True)
+            if not music_df.empty:
+                if music_df[["energy", "valence", "danceability"]].notna().sum().sum() > 0:
+                    mood = describe_music_mood(music_df)
+                    st.markdown(f"<h3 style='margin:.4rem 0'>{html.escape(mood['headline'])}</h3><p class='muted'>{html.escape(mood['description'])}</p>", unsafe_allow_html=True)
+                    if mood.get("energy") is not None:
+                        st.progress(float(mood["energy"]))
+                    st.caption(f"Energia {format_percent(mood.get('energy'))} · Valência {format_percent(mood.get('valence'))} · Dançabilidade {format_percent(mood.get('danceability'))}")
+                else:
+                    st.caption("Faixas sincronizadas; o Spotify não disponibilizou as métricas de áudio nesta consulta.")
+            else:
+                st.caption("Ainda não há dados musicais sincronizados.")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with b:
+            st.markdown("<div class='glass-card'><b>🎬 Sua filmografia</b>", unsafe_allow_html=True)
+            if not films_df.empty:
+                genre_counts: dict[str, int] = {}
+                for value in films_df.loc[~films_df["is_watchlist"].fillna(False), "genres"].fillna(""):
+                    for genre in str(value).split(","):
+                        genre = genre.strip()
+                        if genre:
+                            genre_counts[genre] = genre_counts.get(genre, 0) + 1
+                if genre_counts:
+                    top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:4]
+                    st.markdown(" ".join(f"<span class='aero-pill'>{html.escape(g)} · {n}</span>" for g, n in top_genres), unsafe_allow_html=True)
+                else:
+                    st.caption("Adicione gêneros aos seus filmes na aba Letterboxd para descobrir sua estética cinematográfica.")
+            else:
+                st.caption("Importe seu histórico do Letterboxd para começar.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if not music_df.empty:
+        st.subheader("O som que mais aparece no seu perfil")
+        chart_df = music_df.head(12).copy()
+        fig = px.bar(chart_df, x="track_name", y="energy", color="valence", hover_data=["artist_names", "danceability"],
+                     labels={"track_name": "Faixa", "energy": "Energia", "valence": "Valência", "artist_names": "Artista"},
+                     color_continuous_scale="Tealgrn")
+        fig.update_layout(plot_bgcolor="rgba(255,255,255,.35)", paper_bgcolor="rgba(255,255,255,0)", font_color="#24516c", margin=dict(l=5,r=5,t=20,b=5))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if latest_snapshot:
+        st.caption(f"Última sincronização do Spotify: {latest_snapshot.get('created_at', 'data não informada')} · período: {latest_snapshot.get('time_range', 'médio prazo')}")
+
+# -------------------------------- Letterboxd --------------------------------
+elif page == "Letterboxd":
+    page_header("Sua filmografia", "Importe seu histórico e enriqueça cada filme automaticamente com dados cinematográficos do TMDB.", "🎞️")
+    st.markdown("<div class='callout'>No Letterboxd, use <b>Settings → Import & Export → Export Your Data</b>. Extraia o arquivo e selecione os CSVs abaixo. O Cinefy reconhece diário, avaliações e watchlist.</div>", unsafe_allow_html=True)
+    uploads = st.file_uploader("Selecione os CSVs do Letterboxd", type=["csv"], accept_multiple_files=True, key="lb_uploads")
+    if uploads and st.button("Importar histórico", type="primary"):
+        try:
+            imported = parse_letterboxd_uploads(uploads)
+            if imported.empty:
+                st.warning("Não encontrei filmes reconhecíveis. Confira se selecionou os CSVs exportados pelo Letterboxd.")
+            else:
+                save_films(imported.to_dict("records"))
+                st.success(f"{len(imported)} filmes processados e salvos no Cinefy.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Não consegui ler os arquivos: {exc}")
+
+    films_df = get_films()
+    if not films_df.empty:
+        st.divider()
+        st.subheader("🪄 Enriquecimento automático com TMDB")
+        if not is_tmdb_configured():
+            st.warning("Configure o token do TMDB em `.streamlit/secrets.toml` para buscar gêneros, diretores, sinopses e pôsteres automaticamente.")
+            st.code('[tmdb]\nbearer_token = "SEU_API_READ_ACCESS_TOKEN"', language="toml")
+            st.markdown("Crie uma conta em [themoviedb.org](https://www.themoviedb.org/), acesse **Configurações → API** e copie o **API Read Access Token**. O token fica somente nos Secrets do Streamlit.")
+        else:
+            has_tmdb = films_df.get("tmdb_id", pd.Series(index=films_df.index, dtype="float64")).notna()
+            status = films_df.get("metadata_status", pd.Series(index=films_df.index, dtype="object")).fillna("")
+            needs_first_pass = films_df[~has_tmdb & ~status.isin(["needs_review", "not_found"])]
+            linked_count = int(has_tmdb.sum())
+            needs_review_count = int(status.eq("needs_review").sum())
+            not_found_count = int(status.eq("not_found").sum())
+            a, b, c = st.columns(3)
+            a.metric("Filmes identificados", f"{linked_count}/{len(films_df)}")
+            b.metric("Precisam de revisão", needs_review_count)
+            c.metric("Sem resultado", not_found_count)
+            if not needs_first_pass.empty:
+                st.caption(f"{len(needs_first_pass)} filme(s) ainda não foram consultados no TMDB.")
+                batch_size = st.selectbox("Quantidade por processamento", [10, 25, 50, 100, "Todos"], index=1, key="tmdb_batch_size")
+                to_process = needs_first_pass if batch_size == "Todos" else needs_first_pass.head(int(batch_size))
+                if st.button(f"Buscar dados de {len(to_process)} filme(s) no TMDB", type="primary"):
+                    progress = st.progress(0, text="Preparando consulta ao TMDB...")
+                    success_count = 0
+                    review_count = 0
+                    not_found_count_run = 0
+                    errors: list[str] = []
+                    review_candidates = st.session_state.get("tmdb_review_candidates", {})
+                    for index, (_, film_row) in enumerate(to_process.iterrows(), start=1):
+                        try:
+                            details, candidates = find_and_enrich_movie(str(film_row["title"]), int(film_row["year"]) if pd.notna(film_row.get("year")) else None)
+                            if details:
+                                update_tmdb_metadata(str(film_row["film_key"]), details)
+                                success_count += 1
+                            elif candidates:
+                                update_tmdb_metadata(str(film_row["film_key"]), {"metadata_status": "needs_review", "metadata_source": "TMDB"})
+                                review_candidates[str(film_row["film_key"])] = candidates
+                                review_count += 1
+                            else:
+                                update_tmdb_metadata(str(film_row["film_key"]), {"metadata_status": "not_found", "metadata_source": "TMDB"})
+                                not_found_count_run += 1
+                        except Exception as exc:
+                            errors.append(f"{film_row['title']}: {exc}")
+                        progress.progress(index / len(to_process))
+                    st.session_state["tmdb_review_candidates"] = review_candidates
+                    st.success(f"Concluído: {success_count} identificado(s), {review_count} para revisão e {not_found_count_run} sem resultado.")
+                    if errors:
+                        st.warning("Algumas consultas falharam: " + " · ".join(errors[:5]))
+                    st.rerun()
+
+            # Manual resolution for ambiguous titles and films not found automatically.
+            films_df = get_films()
+            unmatched = films_df[films_df["tmdb_id"].isna()] if "tmdb_id" in films_df else films_df
+            if not unmatched.empty:
+                st.markdown("#### Conferir correspondências")
+                st.caption("O Cinefy evita escolher automaticamente quando títulos, remakes ou anos deixam a correspondência incerta. Selecione a versão correta abaixo.")
+                film_labels = {format_film_option(row): str(row["film_key"]) for _, row in unmatched.iterrows()}
+                selected_label = st.selectbox("Filme do Letterboxd", list(film_labels.keys()), key="tmdb_film_to_review")
+                selected_key = film_labels[selected_label]
+                selected_film = unmatched[unmatched["film_key"].astype(str) == selected_key].iloc[0]
+                default_year = int(selected_film["year"]) if pd.notna(selected_film.get("year")) else None
+                search_col, year_col = st.columns([3, 1])
+                with search_col:
+                    manual_query = st.text_input("Título para pesquisar no TMDB", value=str(selected_film["title"]), key=f"tmdb_query_{selected_key}")
+                with year_col:
+                    manual_year = st.number_input("Ano", min_value=1870, max_value=2100, value=default_year or 2000, step=1, key=f"tmdb_year_{selected_key}")
+                if st.button("Pesquisar título no TMDB", key=f"tmdb_search_{selected_key}"):
+                    try:
+                        results = search_movies(manual_query, int(manual_year) if manual_year else None)
+                        st.session_state["tmdb_manual_candidates"] = results[:10]
+                        st.session_state["tmdb_manual_film_key"] = selected_key
+                        if not results:
+                            st.info("Nenhum resultado encontrado. Tente o título original ou pesquise sem o ano.")
+                    except Exception as exc:
+                        st.error(f"Falha na pesquisa: {exc}")
+                candidates = st.session_state.get("tmdb_manual_candidates", []) if st.session_state.get("tmdb_manual_film_key") == selected_key else st.session_state.get("tmdb_review_candidates", {}).get(selected_key, [])
+                if candidates:
+                    def candidate_label(item: dict[str, Any]) -> str:
+                        release = str(item.get("release_date") or "")[:4] or "ano desconhecido"
+                        original = item.get("original_title") or item.get("title") or ""
+                        score = item.get("_cinefy_score")
+                        score_text = f" · compatibilidade {score:.0%}" if isinstance(score, (int, float)) else ""
+                        return f"{item.get('title') or original} ({release}) · original: {original} · TMDB #{item.get('id')}{score_text}"
+                    candidate_map = {candidate_label(item): item for item in candidates}
+                    chosen_label = st.selectbox("Escolha a correspondência correta", list(candidate_map.keys()), key=f"tmdb_candidate_{selected_key}")
+                    chosen = candidate_map[chosen_label]
+                    overview_preview = str(chosen.get("overview") or "Sinopse indisponível na pesquisa.")
+                    st.caption(overview_preview[:500] + ("…" if len(overview_preview) > 500 else ""))
+                    if st.button("Confirmar filme e importar metadados", type="primary", key=f"tmdb_apply_{selected_key}"):
+                        try:
+                            details = get_movie_details(int(chosen["id"]))
+                            update_tmdb_metadata(selected_key, details)
+                            st.session_state.get("tmdb_review_candidates", {}).pop(selected_key, None)
+                            st.session_state.pop("tmdb_manual_candidates", None)
+                            st.session_state.pop("tmdb_manual_film_key", None)
+                            st.success("Dados cinematográficos importados do TMDB.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Não consegui importar os detalhes: {exc}")
+
+        films_df = get_films()
+        st.divider()
+        st.subheader("Biblioteca cinematográfica")
+        st.caption("Pesquise e filtre sua coleção antes de editar ou explorar os pôsteres.")
+        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 1, 1, 1])
+        with filter_col1:
+            library_search = st.text_input("Buscar filme, diretor ou gênero", key="library_search")
+        with filter_col2:
+            status_filter = st.selectbox("Situação", ["Todos", "Assistidos", "Watchlist"], key="library_status")
+        with filter_col3:
+            valid_years = pd.to_numeric(films_df.get("year", pd.Series(dtype=float)), errors="coerce").dropna()
+            decades = sorted({(int(year) // 10) * 10 for year in valid_years}, reverse=True)
+            decade_options = ["Todas"] + [f"{decade}s" for decade in decades]
+            decade_filter = st.selectbox("Década", decade_options, key="library_decade")
+        with filter_col4:
+            genre_values = set()
+            for raw_genres in films_df.get("genres", pd.Series(dtype=str)).dropna():
+                genre_values.update(value.strip() for value in str(raw_genres).split(",") if value.strip())
+            genre_options = ["Todos"] + sorted(genre_values, key=str.casefold)
+            genre_filter = st.selectbox("Gênero", genre_options, key="library_genre")
+
+        library_view = films_df.copy()
+        if library_search.strip():
+            search_mask = pd.Series(False, index=library_view.index)
+            for search_column in ("title", "director", "genres"):
+                if search_column in library_view.columns:
+                    search_mask |= library_view[search_column].fillna("").astype(str).str.contains(library_search.strip(), case=False, regex=False)
+            library_view = library_view[search_mask]
+        if status_filter == "Assistidos":
+            library_view = library_view[~library_view["is_watchlist"].fillna(False).astype(bool)]
+        elif status_filter == "Watchlist":
+            library_view = library_view[library_view["is_watchlist"].fillna(False).astype(bool)]
+        if decade_filter != "Todas":
+            selected_decade = int(decade_filter[:-1])
+            years_numeric = pd.to_numeric(library_view["year"], errors="coerce")
+            library_view = library_view[years_numeric.between(selected_decade, selected_decade + 9)]
+        if genre_filter != "Todos":
+            library_view = library_view[library_view["genres"].fillna("").astype(str).apply(
+                lambda values: genre_filter.casefold() in {item.strip().casefold() for item in values.split(",")}
+            )]
+        st.caption(f"{len(library_view)} de {len(films_df)} filmes exibidos")
+
+        editable = library_view[["film_key", "title", "year", "watched_date", "rating", "is_watchlist", "director", "genres", "tags"]].copy()
+        editable = editable.rename(columns={
+            "film_key": "Chave", "title": "Filme", "year": "Ano", "watched_date": "Data assistido",
+            "rating": "Nota", "is_watchlist": "Na watchlist", "director": "Diretor", "genres": "Gêneros", "tags": "Tags"
+        })
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["Chave", "Filme", "Ano", "Data assistido", "Nota", "Na watchlist", "Tags"],
+            column_config={
+                "Nota": st.column_config.NumberColumn("Nota", min_value=0, max_value=5, step=0.5, format="%.1f"),
+                "Na watchlist": st.column_config.CheckboxColumn("Na watchlist"),
+                "Diretor": st.column_config.TextColumn("Diretor"),
+                "Gêneros": st.column_config.TextColumn("Gêneros", help="Separe por vírgula"),
+            },
+            key="film_editor",
+        )
+        if st.button("Salvar gêneros e diretores", type="primary"):
+            updates = edited.rename(columns={"Chave": "film_key", "Diretor": "director", "Gêneros": "genres"})[["film_key", "director", "genres"]].to_dict("records")
+            update_film_metadata(updates)
+            st.success("Metadados atualizados manualmente.")
+            st.rerun()
+
+        st.subheader("Pôsteres e sinopses")
+        enriched_all = library_view[library_view.get("tmdb_id", pd.Series(index=library_view.index, dtype="float64")).notna()]
+        poster_limit = st.selectbox("Filmes exibidos", [12, 24, 48, "Todos"], index=0, key="poster_limit")
+        enriched = enriched_all if poster_limit == "Todos" else enriched_all.head(int(poster_limit))
+        if enriched.empty:
+            st.info("Assim que os filmes forem identificados no TMDB, os pôsteres e sinopses aparecerão aqui.")
+        else:
+            poster_cols = st.columns(4)
+            for index, (_, film_row) in enumerate(enriched.iterrows()):
+                with poster_cols[index % 4]:
+                    poster_url = str(film_row.get("poster_url") or "")
+                    if poster_url.startswith("https://"):
+                        st.image(poster_url, use_column_width=True)
+                    else:
+                        st.markdown("<div class='glass-card' style='text-align:center;padding:48px 8px'>🎞️<br><span class='muted'>Pôster indisponível</span></div>", unsafe_allow_html=True)
+                    st.markdown(f"**{html.escape(str(film_row['title']))}**")
+                    st.caption(f"{html.escape(str(film_row.get('year') or ''))} · {html.escape(str(film_row.get('director') or 'Direção não informada'))}")
+                    st.caption(str(film_row.get("genres") or "Gêneros não informados"))
+                    overview = str(film_row.get("overview") or "Sinopse indisponível.")
+                    st.markdown(f"<div class='muted' style='font-size:.82rem'>{html.escape(overview[:350])}{'…' if len(overview) > 350 else ''}</div>", unsafe_allow_html=True)
+                    if film_row.get("tmdb_url"):
+                        st.markdown(f"[Ver no TMDB]({html.escape(str(film_row['tmdb_url']))})")
+        st.download_button("Exportar filmes em CSV", films_df.to_csv(index=False).encode("utf-8-sig"), "cinefy_filmes.csv", "text/csv")
+        snapshots_df = get_snapshots()
+        backup_payload = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "application": "Cinefy",
+            "films": films_df.where(pd.notna(films_df), None).to_dict("records"),
+            "music_snapshots": snapshots_df.where(pd.notna(snapshots_df), None).to_dict("records"),
+        }
+        st.download_button(
+            "Baixar backup completo (JSON)",
+            data=json.dumps(backup_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+            file_name=f"cinefy_backup_{datetime.now().strftime('%Y%m%d')}.json",
+            mime="application/json",
+            help="Inclui filmes e histórico de sincronizações musicais. Guarde em local seguro.",
+        )
+    else:
+        st.info("Nenhum filme importado ainda.")
+
+# ---------------------------------- Spotify ----------------------------------
+elif page == "Spotify":
+    page_header("Sua identidade sonora", "Conecte o Spotify, sincronize suas faixas e transforme seu gosto musical em dados exploráveis.", "🎧")
+    if not is_spotify_configured():
+        st.warning("Falta configurar Spotify Client ID e Client Secret. Veja o arquivo README.md e o exemplo em .streamlit/secrets.toml.example.")
+    else:
+        token = current_token()
+        if not token:
+            st.markdown("<div class='callout'>🔒 O Cinefy só acessa os dados depois da sua autorização. A conexão utiliza OAuth do Spotify.</div>", unsafe_allow_html=True)
+            if "spotify_oauth_state" not in st.session_state:
+                st.session_state["spotify_oauth_state"] = secrets.token_urlsafe(24)
+            auth_url = build_authorize_url(st.session_state["spotify_oauth_state"])
+            st.link_button("Conectar minha conta Spotify", auth_url, use_container_width=True)
+            st.caption("Permissões solicitadas: ler Top Artists/Tracks e criar playlists privadas.")
+        else:
+            st.success("Conexão Spotify autorizada nesta sessão.")
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                time_range = st.selectbox("Janela de análise", ["short_term", "medium_term", "long_term"], index=1,
+                                          format_func=lambda x: {"short_term": "Últimas 4 semanas", "medium_term": "Últimos 6 meses", "long_term": "Último ano"}[x])
+                if st.button("Sincronizar meu perfil musical", type="primary", use_container_width=True):
+                    with st.spinner("Buscando suas músicas e calculando a assinatura sonora..."):
+                        try:
+                            payload = sync_top_music(time_range)
+                            save_music_snapshot(payload)
+                            st.success(f"Sincronização concluída: {len(payload.get('tracks', []))} faixas e {len(payload.get('artists', []))} artistas.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Não foi possível sincronizar: {exc}")
+                if st.button("Desconectar Spotify", use_container_width=True):
+                    st.session_state.pop("spotify_token", None)
+                    st.rerun()
+            with col2:
+                st.markdown("<div class='callout'><b>O que é sincronizado?</b><br>Seu Top 50 de faixas, Top 50 de artistas e métricas de áudio disponíveis (energia, valência e dançabilidade). O Cinefy salva um retrato da sincronização para comparar períodos.</div>", unsafe_allow_html=True)
+
+    latest_snapshot = get_latest_snapshot()
+    if latest_snapshot:
+        st.subheader("Top tracks mais recentes")
+        latest_df = build_music_dataframe(latest_snapshot.get("tracks", []))
+        if not latest_df.empty:
+            show_cols = [c for c in ["track_name", "artist_names", "album_name", "energy", "valence", "danceability"] if c in latest_df.columns]
+            st.dataframe(latest_df[show_cols].rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "album_name":"Álbum", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade"}), use_container_width=True, hide_index=True)
+            if latest_df[["energy", "valence", "danceability"]].notna().sum().sum() > 0:
+                mood = describe_music_mood(latest_df)
+                st.markdown(f"<div class='glass-card'><b>{html.escape(mood['headline'])}</b><p class='muted'>{html.escape(mood['description'])}</p></div>", unsafe_allow_html=True)
+            else:
+                st.warning("As faixas foram importadas, mas as métricas de áudio não foram disponibilizadas para esta aplicação Spotify.")
+
+# ------------------------------- Director's Cut ------------------------------
+elif page == "Director's Cut":
+    page_header("Director's Cut", "Uma trilha sonora alternativa feita com as músicas que já fazem parte da sua vida.", "🎬")
+    if films_df.empty:
+        st.info("Importe seu diário do Letterboxd primeiro.")
+    elif music_df.empty:
+        st.info("Sincronize o Spotify primeiro para gerar uma playlist com seu repertório musical.")
+    else:
+        candidates = films_df[~films_df["is_watchlist"].fillna(False)].copy()
+        if candidates.empty:
+            candidates = films_df.copy()
+        selected_label = st.selectbox("Escolha um filme", candidates.apply(format_film_option, axis=1).tolist())
+        film = candidates.iloc[candidates.apply(format_film_option, axis=1).tolist().index(selected_label)]
+        genres = str(film.get("genres") or "").strip()
+        director = str(film.get("director") or "").strip()
+        film_poster_col, film_info_col = st.columns([1, 3])
+        with film_poster_col:
+            if film.get("poster_url"):
+                st.image(str(film["poster_url"]), use_column_width=True)
+        with film_info_col:
+            st.markdown(f"<div class='glass-card'><h3 style='margin-top:0'>{html.escape(str(film['title']))}</h3><span class='aero-pill'>{html.escape(str(int(film['year'])) if pd.notna(film.get('year')) else 'Ano não informado')}</span><span class='aero-pill'>{html.escape(genres or 'Gêneros não preenchidos')}</span><p class='muted'>Direção: {html.escape(director or 'não informada')}</p><p>{html.escape(str(film.get('overview') or 'Sinopse ainda não disponível.'))}</p></div>", unsafe_allow_html=True)
+        target = get_film_mood_target(genres)
+        st.caption(f"Atmosfera estimada: {target['label']} · energia {target['energy']:.0%} · valência {target['valence']:.0%} · dançabilidade {target['danceability']:.0%}")
+        ranked = rank_tracks_for_film(music_df, genres)
+        st.subheader("Faixas que combinam com esse filme")
+        if "match_available" in ranked.columns and not ranked["match_available"].any():
+            st.warning("O Spotify não forneceu métricas de áudio para estas faixas. A lista mantém a ordem original e não inventa uma compatibilidade.")
+        else:
+            st.caption("A compatibilidade considera somente as métricas realmente disponíveis em cada faixa.")
+        st.dataframe(ranked[[c for c in ["track_name", "artist_names", "energy", "valence", "danceability", "match_score"] if c in ranked.columns]].head(15).rename(columns={"track_name":"Faixa", "artist_names":"Artista(s)", "energy":"Energia", "valence":"Valência", "danceability":"Dançabilidade", "match_score":"Compatibilidade"}), use_container_width=True, hide_index=True)
+        playlist_name = f"Cinefy — {str(film['title'])[:70]}: Director's Cut"
+        st.text_input("Nome da playlist", value=playlist_name, key="director_playlist_name")
+        if st.button("Criar playlist no meu Spotify", type="primary"):
+            token = current_token()
+            if not token:
+                st.error("Conecte o Spotify na aba Spotify.")
+            else:
+                track_uris = ranked.head(30)["uri"].dropna().astype(str).tolist()
+                try:
+                    playlist = create_playlist(st.session_state["director_playlist_name"],
+                                               f"Trilha alternativa gerada pelo Cinefy para {film['title']}. Seleção baseada na atmosfera do filme e no seu perfil musical.", track_uris)
+                    st.success("Playlist criada no Spotify!")
+                    st.link_button("Abrir playlist", playlist["external_urls"]["spotify"])
+                except Exception as exc:
+                    st.error(f"Não consegui criar a playlist. Confira as permissões da conexão Spotify. Detalhe: {exc}")
+
+# -------------------------------- Mood Mirror --------------------------------
+elif page == "Mood Mirror":
+    page_header("Mood Mirror", "O espelho entre aquilo que você escuta e os mundos que escolhe assistir.", "🪞")
+    if music_df.empty:
+        st.info("Sincronize seu Spotify para construir o Mood Mirror.")
+    elif films_df.empty:
+        st.info("Importe seu histórico do Letterboxd para comparar música e cinema.")
+    else:
+        watched = films_df[~films_df["is_watchlist"].fillna(False)].copy()
+        genre_counts: dict[str, int] = {}
+        for raw in watched["genres"].fillna(""):
+            for genre in str(raw).split(","):
+                genre = genre.strip()
+                if genre:
+                    genre_counts[genre] = genre_counts.get(genre, 0) + 1
+        mood = describe_music_mood(music_df)
+        missing_metrics = [column for column in ["energy", "valence", "danceability"] if column not in music_df.columns or music_df[column].notna().sum() == 0]
+        if missing_metrics:
+            labels = {"energy": "energia", "valence": "valência", "danceability": "dançabilidade"}
+            missing_labels = ", ".join(labels[column] for column in missing_metrics)
+            st.warning(f"Métricas indisponíveis nesta sincronização: {missing_labels}. O Cinefy não substitui dados ausentes por valores neutros.")
+        st.subheader("Duas linguagens, um mesmo repertório")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("<div class='glass-card'><h3>🎧 Som</h3>", unsafe_allow_html=True)
+            st.metric("Assinatura musical", mood["headline"])
+            st.metric("Energia média", format_percent(mood.get("energy")))
+            st.metric("Valência média", format_percent(mood.get("valence")))
+            st.metric("Dançabilidade", format_percent(mood.get("danceability")))
+            st.markdown("</div>", unsafe_allow_html=True)
+        with right:
+            st.markdown("<div class='glass-card'><h3>🎞️ Cinema</h3>", unsafe_allow_html=True)
+            if genre_counts:
+                dominant = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+                for genre, count in dominant:
+                    st.markdown(f"<span class='aero-pill'>{html.escape(genre)} · {count}</span>", unsafe_allow_html=True)
+            else:
+                st.warning("Os gêneros dos seus filmes ainda não foram preenchidos. Edite-os na aba Letterboxd.")
+            st.markdown("</div>", unsafe_allow_html=True)
+        if genre_counts:
+            text = make_mood_mirror_text(mood, genre_counts)
+            st.markdown(f"<div class='callout'><h3>🫧 Leitura estética do período</h3><p>{html.escape(text)}</p><small class='muted'>É uma interpretação lúdica dos seus dados, não uma avaliação psicológica.</small></div>", unsafe_allow_html=True)
+            genre_df = pd.DataFrame([{"Gênero": k, "Filmes": v} for k, v in genre_counts.items()]).sort_values("Filmes", ascending=False)
+            fig = px.pie(genre_df, names="Gênero", values="Filmes", hole=.48)
+            fig.update_layout(paper_bgcolor="rgba(255,255,255,0)", font_color="#24516c", legend_title_text="Gêneros")
+            st.plotly_chart(fig, use_container_width=True)
+
+# --------------------------- inverse recommendations ------------------------
+elif page == "Recomendação inversa":
+    page_header("Powered by Music", "Descubra o que assistir com base nos artistas e gêneros que dominam seus fones.", "🍿")
+    if music_df.empty:
+        st.info("Sincronize seu Spotify primeiro.")
+    elif films_df.empty:
+        st.info("Importe também sua watchlist do Letterboxd para receber recomendações.")
+    else:
+        watchlist = films_df[films_df["is_watchlist"].fillna(False)].copy()
+        if watchlist.empty:
+            st.warning("Sua watchlist está vazia ou ainda não foi importada. Importe `watchlist.csv` do Letterboxd.")
+        else:
+            recommendations = inverse_recommendations(music_df, watchlist)
+            st.subheader("Sua próxima sessão")
+            if recommendations.empty:
+                st.info("Ainda não há gêneros musicais ou métricas observadas suficientes para produzir recomendações. Sincronize novamente o Spotify ou aguarde dados disponíveis.")
+            else:
+                for idx, row in recommendations.head(8).iterrows():
+                    year = f" ({int(row['year'])})" if pd.notna(row.get("year")) else ""
+                    st.markdown(
+                        f"<div class='glass-card'><div class='metric-label'>#{int(row['rank'])} · COMPATIBILIDADE ESTÉTICA {row['match_score']:.0%}</div>"
+                        f"<h3 style='margin:.25rem 0'>{html.escape(str(row['title']))}{html.escape(year)}</h3>"
+                        f"<span class='aero-pill'>{html.escape(str(row.get('genres') or 'Gêneros pendentes'))}</span>"
+                        f"<p class='muted'>{html.escape(str(row['reason']))}</p></div>", unsafe_allow_html=True)
+
+st.divider()
+st.caption("Cinefy é um projeto pessoal experimental. Os resultados são leituras estéticas heurísticas, não classificações objetivas de obras ou pessoas.")
+st.caption("Este produto utiliza a API do TMDB, mas não é endossado nem certificado pelo TMDB. Dados e imagens cinematográficas fornecidos por TMDB.")

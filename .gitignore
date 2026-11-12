@@ -1,0 +1,11 @@
+.streamlit/secrets.toml
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+cinefy.db
+.DS_Store
+.env*
+*.db-shm
+*.db-wal
