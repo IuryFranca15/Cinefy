@@ -38,6 +38,14 @@ ENV_SECRET_PATTERN = re.compile(
 PLACEHOLDERS = ("your_", "seu_", "changeme", "example", "placeholder", "xxx", "****", "replace_me", "<")
 
 
+def _effective_suffix(path: Path) -> str:
+    """Extensão real do arquivo; modelos como `secrets.toml.example` contam como `.toml`."""
+    suffix = path.suffix.lower()
+    if suffix in {".example", ".sample", ".template"}:
+        return Path(path.stem).suffix.lower()
+    return suffix
+
+
 @dataclass(frozen=True)
 class Issue:
     severity: str
@@ -86,7 +94,7 @@ class CinefyInspector:
                 path = Path(current) / filename
                 if path.is_symlink() or path.name == "analyzer.py":
                     continue
-                if path.suffix.lower() in TEXT_SUFFIXES or path.name == ".env" or path.name.startswith(".env."):
+                if _effective_suffix(path) in TEXT_SUFFIXES or path.name == ".env" or path.name.startswith(".env."):
                     yield path
 
     def scan_codebase(self) -> list[Issue]:
@@ -111,7 +119,7 @@ class CinefyInspector:
                 self._add("ERROR", "READ_ERROR", path, f"Falha ao ler arquivo: {exc}")
                 continue
 
-            suffix = path.suffix.lower()
+            suffix = _effective_suffix(path)
             if suffix == ".py":
                 self._audit_python(path, content)
             elif suffix == ".json":

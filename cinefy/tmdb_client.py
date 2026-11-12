@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from typing import Any
@@ -24,6 +25,11 @@ def _cache_data(ttl_seconds: int):
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 TMDB_WEB_BASE = "https://www.themoviedb.org/movie"
+MAX_RETRY_AFTER_SECONDS = 5
+
+
+class TMDBAbortError(RuntimeError):
+    """Erro que torna inútil continuar um lote (credencial recusada ou limite de uso)."""
 
 
 def _config_value(key: str, env_name: str = "") -> str:
@@ -51,10 +57,10 @@ def is_tmdb_configured() -> bool:
     return bool(config["bearer_token"] or config["api_key"])
 
 
-def tmdb_request(endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def tmdb_request(endpoint: str, params: dict[str, Any] | None = None, *, _retried: bool = False) -> dict[str, Any]:
     config = get_tmdb_config()
     if not config["bearer_token"] and not config["api_key"]:
-        raise RuntimeError("TMDB não configurado. Adicione tmdb.bearer_token aos Secrets do Streamlit.")
+        raise TMDBAbortError("TMDB não configurado. Adicione tmdb.bearer_token aos Secrets do Streamlit.")
 
     headers = {"accept": "application/json"}
     request_params = dict(params or {})
@@ -66,17 +72,34 @@ def tmdb_request(endpoint: str, params: dict[str, Any] | None = None) -> dict[st
     url = f"{TMDB_API_BASE}/{endpoint.lstrip('/')}"
     try:
         response = requests.get(url, headers=headers, params=request_params, timeout=25)
-        if response.status_code == 401:
-            raise RuntimeError("TMDB recusou a credencial. Confira o API Read Access Token nos Secrets.")
-        if response.status_code == 429:
-            raise RuntimeError("Limite temporário de requisições do TMDB atingido. Aguarde um pouco e tente novamente.")
-        response.raise_for_status()
-        return response.json()
     except requests.Timeout as exc:
         raise RuntimeError("O TMDB demorou demais para responder. Tente novamente.") from exc
     except requests.RequestException as exc:
-        status = exc.response.status_code if exc.response is not None else "indisponível"
-        raise RuntimeError(f"Falha ao consultar o TMDB (HTTP {status}).") from exc
+        raise RuntimeError("Não foi possível falar com o TMDB. Verifique sua conexão.") from exc
+
+    if response.status_code == 401:
+        raise TMDBAbortError("TMDB recusou a credencial. Confira o API Read Access Token nos Secrets.")
+    if response.status_code == 429:
+        # Uma única nova tentativa curta; se persistir, o lote deve parar.
+        try:
+            wait = float(response.headers.get("Retry-After", "1"))
+        except (TypeError, ValueError):
+            wait = 1.0
+        if not _retried and wait <= MAX_RETRY_AFTER_SECONDS:
+            time.sleep(max(wait, 0.5))
+            return tmdb_request(endpoint, params, _retried=True)
+        raise TMDBAbortError("Limite temporário de requisições do TMDB atingido. Aguarde um pouco e tente novamente.")
+    if response.status_code == 404:
+        raise RuntimeError("O TMDB não encontrou este recurso (HTTP 404).")
+    if response.status_code >= 400:
+        raise RuntimeError(f"Falha ao consultar o TMDB (HTTP {response.status_code}).")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("O TMDB devolveu uma resposta ilegível.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("O TMDB devolveu uma resposta inesperada.")
+    return payload
 
 
 def normalize_title(value: Any) -> str:
@@ -122,6 +145,13 @@ def rank_search_results(
     return sorted(ranked, key=lambda x: x["_cinefy_score"], reverse=True)
 
 
+def _valid_results(raw: Any) -> list[dict[str, Any]]:
+    """Descarta itens malformados da busca em vez de quebrar o ranking."""
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict) and item.get("id") is not None]
+
+
 @_cache_data(60 * 60 * 24)
 def search_movies(title: str, year: int | None = None) -> list[dict[str, Any]]:
     if not str(title or "").strip():
@@ -135,13 +165,13 @@ def search_movies(title: str, year: int | None = None) -> list[dict[str, Any]]:
     if year:
         params["year"] = int(year)
     payload = tmdb_request("search/movie", params)
-    results = payload.get("results", []) or []
+    results = _valid_results(payload.get("results"))
     # Some Letterboxd exports contain the release year, while the localized search
     # can fail to find a translated title with that exact year. Retry without it.
     if not results and year:
         params.pop("year", None)
         payload = tmdb_request("search/movie", params)
-        results = payload.get("results", []) or []
+        results = _valid_results(payload.get("results"))
     return rank_search_results(str(title), year, results)
 
 
@@ -175,14 +205,16 @@ def _image_url(path: str | None, size: str = "w500") -> str:
 def get_movie_details(tmdb_id: int) -> dict[str, Any]:
     # credits is appended to the details request to avoid a separate API call.
     details = tmdb_request(f"movie/{int(tmdb_id)}", {"language": "pt-BR", "append_to_response": "credits"})
+    if details.get("id") is None:
+        raise RuntimeError("O TMDB não devolveu os detalhes do filme.")
     credits = details.get("credits", {}) or {}
     crew = credits.get("crew", []) or []
     directors = list(dict.fromkeys(
         str(member.get("name", "")).strip()
         for member in crew
-        if member.get("job") == "Director" and member.get("name")
+        if isinstance(member, dict) and member.get("job") == "Director" and member.get("name")
     ))
-    genres = [str(item.get("name", "")).strip() for item in details.get("genres", []) if item.get("name")]
+    genres = [str(item.get("name", "")).strip() for item in (details.get("genres") or []) if isinstance(item, dict) and item.get("name")]
     release_date = str(details.get("release_date") or "")
     year = int(release_date[:4]) if len(release_date) >= 4 and release_date[:4].isdigit() else None
     return {
